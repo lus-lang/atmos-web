@@ -257,3 +257,52 @@ local function listen_test()
     coroutine.close(serving)
     server:close()
 end
+
+-- The upgrade step and list-valued headers of network.serve arrived with the
+-- terminal functions, so the latter mark a runtime that has them.
+local function needs_runtime_additions()
+    if io.stdout.isatty == nil then
+        skip("needs network.serve upgrades and list headers")
+    end
+end
+
+local function serve_once(app, request)
+    pledge("network")
+    local server = network.tcp.bind("127.0.0.1", 0)
+    local _, port = server:getsockname()
+    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+    local sock <close> = network.tcp.connect("127.0.0.1", port)
+    sock:send(request)
+    local response = vector.tostring(sock:receive("*a"))
+    coroutine.close(serving)
+    server:close()
+    return response
+end
+
+local function upgrade_test()
+    needs_runtime_additions()
+    local app = web.app()
+    app:get("/ws", function(req)
+        return 101, function(sock)
+            sock:send("raw bytes")
+        end
+    end)
+    local response = serve_once(app, "GET /ws HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    assert(response:match("^HTTP/1.1 (%d+)") == "101")
+    assert(response:find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", 1, true))
+    assert(response:sub(-9) == "raw bytes")
+end
+
+local function two_cookies_over_the_wire_test()
+    needs_runtime_additions()
+    local app = web.app()
+    app:get("/", function(req, reply)
+        reply:header("Set-Cookie", "a=1")
+        reply:header("Set-Cookie", "b=2")
+        return 204
+    end)
+    local response = serve_once(app, "GET / HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n")
+    assert(response:find("\r\nSet-Cookie: a=1\r\n", 1, true))
+    assert(response:find("\r\nSet-Cookie: b=2\r\n", 1, true))
+end

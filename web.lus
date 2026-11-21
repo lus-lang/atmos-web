@@ -193,8 +193,7 @@ local function merge_reply(reply, headers)
         end
     end
     if cookies then
-        -- network.serve takes one string per header name. A list of strings
-        -- is passed through for runtimes that write one line per value.
+        -- network.serve writes one header line per element of a list.
         out["Set-Cookie"] = #cookies == 1 and cookies[1] or cookies
     end
     return out
@@ -263,6 +262,11 @@ end
 ---
 --- `options.log` is a function that receives error messages. It defaults to
 --- a function that writes to standard error.
+---
+--- A handler upgrades a connection, as WebSocket does, by returning `101`,
+--- a function, and optionally headers. `network.serve` sends the 101
+--- response, then calls the function with the TCP socket of the connection.
+--- `on_send` hooks do not run for an upgrade.
 --- @param options table? The options.
 --- @return table The application.
 function M.app(options)
@@ -524,7 +528,11 @@ local function compile_route(app, route)
             headers = merge_reply(reply, headers)
         end
         local t = type(body)
-        if t == "table" then
+        if t == "function" and status == 101 then
+            -- An upgrade: network.serve sends the 101 response and calls the
+            -- function with the socket of the connection.
+            return status, body, headers
+        elseif t == "table" then
             local encode = serialize and (serialize[status] or serialize.default) or tojson
             body = encode(body)
             headers = with_type(headers, JSON_TYPE)
