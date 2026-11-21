@@ -1,0 +1,22 @@
+-- The HTTP benchmark of tests/bench/compare served through the web package.
+-- It answers GET / with the same JSON document as server.lus and every
+-- other path with 404.
+local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
+pledge("load", "fs:read", "network")
+package.path = HERE .. "/../?.lus;" .. package.path
+
+local web = require("web")
+
+local port = tonumber(arg[1]) or 8080
+local counter = 0
+
+local app = web.app()
+app:get("/", function(req)
+    counter = counter + 1
+    return { message = "hello", n = counter }
+end)
+app:not_found(function(req)
+    return 404, "not found\n"
+end)
+
+app:listen("127.0.0.1", port)

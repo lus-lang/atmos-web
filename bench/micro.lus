@@ -1,0 +1,26 @@
+local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
+pledge("load", "fs:read")
+package.path = HERE .. "/../?.lus;" .. package.path
+local web = require("web")
+local N = 2000000
+local json_headers = { ["Content-Type"] = "application/json" }
+local counter = 0
+local function bare(req)
+    if req.method == "GET" and req.path == "/" then
+        counter = counter + 1
+        return 200, tojson({ message = "hello", n = counter }), json_headers
+    end
+end
+local app = web.app()
+app:get("/", function(req) counter = counter + 1 return { message = "hello", n = counter } end)
+local h = app:handler()
+local headers = { host = "x" }
+local function run(name, f)
+    local body = vector.create(0)
+    local t = os.clock()
+    for i = 1, N do
+        f({ method = "GET", path = "/", query = "", headers = headers, body = body })
+    end
+    print(name, string.format("%.3f us/req", (os.clock() - t) / N * 1e6))
+end
+run("bare", bare); run("web", h); run("bare", bare); run("web", h)

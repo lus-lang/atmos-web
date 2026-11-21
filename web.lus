@@ -1,0 +1,916 @@
+--- Routes HTTP requests to handlers on top of `network.serve`.
+---
+--- An application holds routes, hooks, and plugins. `app:listen` serves it
+--- with `network.serve`, and `app:inject` answers a request in memory, which
+--- is how tests call it. Routes validate their input and serialize their
+--- output with schemas from the `schema` package. Any value with the
+--- methods `check(value)` and `serializer()` works as a schema.
+---
+--- @package web
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-web
+--- @permission network:server Serves the application in `app:listen`.
+--- @permission network:tcp Binds the address that `app:listen` serves.
+
+local M = {}
+
+local type, math_type, tostring, setmetatable, getmetatable = type, math.type, tostring, setmetatable, getmetatable
+local pairs, ipairs, next = pairs, ipairs, next
+local tojson, fromjson = tojson, fromjson
+
+local JSON_TYPE = "application/json; charset=utf-8"
+local TEXT_TYPE = "text/plain; charset=utf-8"
+local JSON_HEADERS = { ["Content-Type"] = JSON_TYPE }
+local TEXT_HEADERS = { ["Content-Type"] = TEXT_TYPE }
+
+local HOOKS = {
+    on_request = true,
+    pre_validation = true,
+    pre_handler = true,
+    on_send = true,
+    on_response = true,
+    on_error = true,
+}
+
+local METHODS = { "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" }
+
+-- A shared empty table for requests without a query string or path
+-- parameters. Writing to it raises an error, so one request cannot leak
+-- values into another.
+local EMPTY = setmetatable({}, {
+    __newindex = function() error("attempt to modify an empty request table", 2) end,
+    __metatable = false,
+})
+
+-- Errors ------------------------------------------------------------------------
+
+local HttpError = {}
+HttpError.__index = HttpError
+HttpError.__tostring = function(err)
+    return `$(err.status) $(err.message)`
+end
+
+--- Raises an error object that the framework answers with `status`.
+---
+--- The response body is the JSON object `{ "error": message }`, with a
+--- `details` field when `details` is given.
+--- @param status integer The status of the response.
+--- @param message string? The message, which defaults to the reason phrase.
+--- @param details any? More data for the client.
+function M.raise(status, message, details)
+    error(setmetatable({ status = status, message = message or "error", details = details }, HttpError), 2)
+end
+
+--- Returns true if `value` is an error object that `web.raise` raised.
+--- @param value any The value to test.
+--- @return boolean
+function M.ishttperror(value)
+    return getmetatable(value) == HttpError
+end
+
+-- Query strings and forms -----------------------------------------------------------
+
+local function unescape(text)
+    if text:find("[%%+]") == nil then
+        return text
+    end
+    text = text:gsub("+", " ")
+    return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+end
+
+--- Decodes `a=1&b=2` into a table.
+---
+--- A key that appears more than once gets a list of its values. Keys and
+--- values are percent-decoded and `+` decodes to a space.
+--- @param text string The query string without the `?`.
+--- @return table
+function M.decode_query(text)
+    local out = {}
+    if text == nil or text == "" then
+        return out
+    end
+    for pair in text:gmatch("[^&]+") do
+        local key, value = pair:match("^([^=]*)=(.*)$")
+        if key == nil then
+            key, value = pair, ""
+        end
+        key = unescape(key)
+        value = unescape(value)
+        local old = out[key]
+        if old == nil then
+            out[key] = value
+        elseif type(old) == "table" then
+            old[#old + 1] = value
+        else
+            out[key] = { old, value }
+        end
+    end
+    return out
+end
+
+local function decode_param(text)
+    if text:find("%", 1, true) == nil then
+        return text
+    end
+    return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+end
+
+-- Responses ---------------------------------------------------------------------------
+
+local Reply = {}
+Reply.__index = Reply
+
+--- Sets a response header.
+---
+--- A second value for the same name replaces the first, except for
+--- `Set-Cookie`, which keeps every value.
+--- @param name string The header name.
+--- @param value string The value.
+--- @return table The reply, for chaining.
+function Reply:header(name, value)
+    local headers = self.headers
+    if headers == nil then
+        headers = {}
+        self.headers = headers
+    end
+    if name:lower() == "set-cookie" then
+        local cookies = self.cookies
+        if cookies == nil then
+            cookies = {}
+            self.cookies = cookies
+        end
+        cookies[#cookies + 1] = value
+    else
+        headers[name] = value
+    end
+    return self
+end
+
+--- Sets the `Content-Type` of the response.
+--- @param mime string The media type.
+--- @return table The reply, for chaining.
+function Reply:type(mime)
+    return self:header("Content-Type", mime)
+end
+
+--- Sets the status of the response.
+---
+--- A status that the handler returns takes precedence.
+--- @param code integer The status.
+--- @return table The reply, for chaining.
+function Reply:status(code)
+    self.code = code
+    return self
+end
+
+--- Returns a redirect response for the handler to return.
+--- @param url string The target of the redirect.
+--- @param code integer? The status, 302 by default.
+--- @return integer, string, table
+function Reply:redirect(url, code)
+    self:header("Location", url)
+    return code or 302, ""
+end
+
+-- Merges the reply state into the headers that the handler returned.
+local function merge_reply(reply, headers)
+    local own = reply.headers
+    local cookies = reply.cookies
+    if own == nil and cookies == nil then
+        return headers
+    end
+    local out = {}
+    if own then
+        for k, v in pairs(own) do
+            out[k] = v
+        end
+    end
+    if headers then
+        for k, v in pairs(headers) do
+            out[k] = v
+        end
+    end
+    if cookies then
+        -- network.serve takes one string per header name. A list of strings
+        -- is passed through for runtimes that write one line per value.
+        out["Set-Cookie"] = #cookies == 1 and cookies[1] or cookies
+    end
+    return out
+end
+
+local function has_type(headers)
+    if headers == nil then
+        return false
+    end
+    if headers["Content-Type"] or headers["content-type"] then
+        return true
+    end
+    for k in pairs(headers) do
+        if type(k) == "string" and k:lower() == "content-type" then
+            return true
+        end
+    end
+    return false
+end
+
+local function with_type(headers, mime)
+    if headers == nil then
+        return mime == JSON_TYPE and JSON_HEADERS or TEXT_HEADERS
+    end
+    if has_type(headers) then
+        return headers
+    end
+    local out = { ["Content-Type"] = mime }
+    for k, v in pairs(headers) do
+        out[k] = v
+    end
+    return out
+end
+
+-- Turns the results of a handler into `status, body, headers`.
+local function normalize(a, b, c)
+    if math_type(a) == "integer" then
+        return a, b, c
+    end
+    return 200, a, b
+end
+
+local function error_response(status, message, details)
+    local body = { error = message }
+    if details ~= nil then
+        body.details = details
+    end
+    return status, tojson(body), JSON_HEADERS
+end
+
+-- Scopes and applications ---------------------------------------------------------------
+
+local Scope = {}
+
+local function new_scope(parent, prefix)
+    local scope = setmetatable({}, Scope)
+    scope.parent = parent
+    scope.root = parent and parent.root or scope
+    scope.prefix = (parent and parent.prefix or "") .. (prefix or "")
+    scope.hooks = {}
+    scope.decorations = parent and setmetatable({}, { __index = parent.decorations }) or {}
+    return scope
+end
+
+--- Creates an application.
+---
+--- `options.log` is a function that receives error messages. It defaults to
+--- a function that writes to standard error.
+--- @param options table? The options.
+--- @return table The application.
+function M.app(options)
+    options = options or {}
+    local app = new_scope(nil, "")
+    app.routes = {}
+    app.log = options.log or function(message)
+        io.stderr:write("web: ", tostring(message), "\n")
+    end
+    app.reply_methods = setmetatable({}, { __index = Reply })
+    app.reply_meta = { __index = app.reply_methods }
+    app.not_found_handler = nil
+    return app
+end
+
+Scope.__index = function(scope, key)
+    local method = Scope[key]
+    if method ~= nil then
+        return method
+    end
+    local decorations = rawget(scope, "decorations")
+    return decorations and decorations[key]
+end
+
+--- Adds a route.
+---
+--- `options` may be omitted. It holds the schemas `params`, `query`,
+--- `body`, `headers`, and `response`, and per-route hooks under the hook
+--- names. `response` is a schema or a table from status codes to schemas.
+--- @param method string|table The method, a list of methods, or `"*"`.
+--- @param path string The path pattern.
+--- @param options table|function The options, or the handler.
+--- @param handler function? The handler.
+--- @return table The scope, for chaining.
+function Scope:route(method, path, options, handler)
+    if handler == nil then
+        handler, options = options, {}
+    end
+    if type(handler) ~= "function" then
+        error("route handler must be a function", 2)
+    end
+    local methods
+    if method == "*" then
+        methods = METHODS
+    elseif type(method) == "table" then
+        methods = method
+    else
+        methods = { method }
+    end
+    local full = self.prefix .. path
+    if full == "" then
+        full = "/"
+    end
+    local routes = self.root.routes
+    for _, m in ipairs(methods) do
+        routes[#routes + 1] = {
+            method = m:upper(),
+            path = full,
+            options = options,
+            handler = handler,
+            scope = self,
+        }
+    end
+    self.root.compiled = nil
+    return self
+end
+
+for _, method in ipairs(METHODS) do
+    Scope[method:lower()] = function(self, path, options, handler)
+        return self:route(method, path, options, handler)
+    end
+end
+
+--- Adds a route for every method.
+--- @param path string The path pattern.
+--- @param options table|function The options, or the handler.
+--- @param handler function? The handler.
+--- @return table The scope, for chaining.
+function Scope:all(path, options, handler)
+    return self:route("*", path, options, handler)
+end
+
+--- Adds a hook to this scope and the scopes registered from it.
+--- @param name string One of `on_request`, `pre_validation`, `pre_handler`, `on_send`, `on_response`, and `on_error`.
+--- @param fn function The hook.
+--- @return table The scope, for chaining.
+function Scope:hook(name, fn)
+    if not HOOKS[name] then
+        error(`unknown hook '$name'`, 2)
+    end
+    local list = self.hooks[name]
+    if list == nil then
+        list = {}
+        self.hooks[name] = list
+    end
+    list[#list + 1] = fn
+    self.root.compiled = nil
+    return self
+end
+
+--- Adds a named value to the scope, which handlers read as `req.app.NAME`.
+--- @param name string The name.
+--- @param value any The value.
+--- @return table The scope, for chaining.
+function Scope:decorate(name, value)
+    if Scope[name] ~= nil or rawget(self.decorations, name) ~= nil then
+        error(`decoration '$name' already exists`, 2)
+    end
+    self.decorations[name] = value
+    return self
+end
+
+--- Adds a method to the reply object of every handler of the application.
+--- @param name string The method name.
+--- @param fn function The method, called as `reply:NAME(...)`.
+--- @return table The scope, for chaining.
+function Scope:decorate_reply(name, fn)
+    self.root.reply_methods[name] = fn
+    return self
+end
+
+--- Registers a plugin in a child scope.
+---
+--- `plugin` is a function `plugin(scope, options)` or a table with such a
+--- function in its `register` field. A table with `shared = true` registers
+--- into this scope itself, so its hooks and decorations apply to every route
+--- of this scope. `options.prefix` prefixes every route of the child.
+--- @param plugin function|table The plugin.
+--- @param options table? The options of the plugin.
+--- @return table The scope, for chaining.
+function Scope:register(plugin, options)
+    options = options or {}
+    local fn, shared = plugin, false
+    if type(plugin) == "table" then
+        fn, shared = plugin.register, plugin.shared
+    end
+    if type(fn) ~= "function" then
+        error("plugin must be a function or a table with a register function", 2)
+    end
+    local target = shared and self or new_scope(self, options.prefix)
+    fn(target, options)
+    return self
+end
+
+--- Sets the handler for requests that match no route.
+--- @param handler function The handler.
+--- @return table The scope, for chaining.
+function Scope:not_found(handler)
+    self.root.not_found_handler = handler
+    self.root.compiled = nil
+    return self
+end
+
+-- Compilation ---------------------------------------------------------------------------------
+
+local function scope_hooks(scope, name, route_options)
+    local chain = {}
+    local s = scope
+    while s do
+        table.insert(chain, 1, s)
+        s = s.parent
+    end
+    local out = {}
+    for _, sc in ipairs(chain) do
+        local list = sc.hooks[name]
+        if list then
+            for _, fn in ipairs(list) do
+                out[#out + 1] = fn
+            end
+        end
+    end
+    local own = route_options and route_options[name]
+    if type(own) == "function" then
+        out[#out + 1] = own
+    elseif type(own) == "table" then
+        for _, fn in ipairs(own) do
+            out[#out + 1] = fn
+        end
+    end
+    return out
+end
+
+local function issues_body(where, err)
+    local list = {}
+    for i, issue in ipairs(err.issues) do
+        local path = { where }
+        for j, key in ipairs(issue.path) do
+            path[j + 1] = tostring(key)
+        end
+        list[i] = { path = table.concat(path, "."), message = issue.message, code = issue.code }
+    end
+    return list
+end
+
+local function decode_body(req)
+    local raw = req.body
+    req.raw = raw
+    if raw == nil or vector.size(raw) == 0 then
+        req.body = nil
+        return
+    end
+    local ctype = req.headers["content-type"] or ""
+    if ctype:find("json", 1, true) then
+        local ok, value = catch fromjson(vector.tostring(raw))
+        if not ok then
+            M.raise(400, "invalid JSON body")
+        end
+        req.body = value
+    elseif ctype:find("application/x-www-form-urlencoded", 1, true) then
+        req.body = M.decode_query(vector.tostring(raw))
+    elseif ctype:find("text/", 1, true) then
+        req.body = vector.tostring(raw)
+    end
+end
+
+local function serializers(response)
+    if response == nil then
+        return nil
+    end
+    local out = {}
+    if getmetatable(response) ~= nil and type(response.serializer) == "function" then
+        out.default = response:serializer()
+        return out
+    end
+    for status, s in pairs(response) do
+        out[status] = s:serializer()
+    end
+    return out
+end
+
+-- Builds the function that answers one route. A route without hooks,
+-- schemas, or a reply parameter becomes a direct call of the handler
+-- followed by the conversion of its results.
+local function compile_route(app, route)
+    local handler = route.handler
+    local options = route.options
+    local scope = route.scope
+    local wants_reply = debug.getinfo(handler, "u").nparams >= 2
+    local on_request = scope_hooks(scope, "on_request", options)
+    local pre_validation = scope_hooks(scope, "pre_validation", options)
+    local pre_handler = scope_hooks(scope, "pre_handler", options)
+    local on_send = scope_hooks(scope, "on_send", options)
+    local on_response = scope_hooks(scope, "on_response", options)
+    local on_error = scope_hooks(scope, "on_error", options)
+    local params_check = options.params
+    local query_check = options.query
+    local body_check = options.body
+    local headers_check = options.headers
+    local serialize = serializers(options.response)
+    local pattern = route.path
+    local reply_meta = app.reply_meta
+    local log = app.log
+
+    local function finish(req, status, body, headers, reply)
+        if reply then
+            if reply.code and status == 200 then
+                status = reply.code
+            end
+            headers = merge_reply(reply, headers)
+        end
+        local t = type(body)
+        if t == "table" then
+            local encode = serialize and (serialize[status] or serialize.default) or tojson
+            body = encode(body)
+            headers = with_type(headers, JSON_TYPE)
+        elseif t == "string" or t == "vector" then
+            headers = with_type(headers, TEXT_TYPE)
+        elseif body == nil then
+            body = ""
+        else
+            body = tostring(body)
+            headers = with_type(headers, TEXT_TYPE)
+        end
+        for i = 1, #on_send do
+            status, body, headers = on_send[i](req, status, body, headers)
+        end
+        for i = 1, #on_response do
+            on_response[i](req, status)
+        end
+        return status, body, headers
+    end
+
+    local function validate(req, schema, where, value)
+        local ok, parsed = schema:check(value)
+        if not ok then
+            M.raise(400, `invalid $where`, issues_body(where, parsed))
+        end
+        return parsed
+    end
+
+    local function run_hooks(list, req, reply)
+        for i = 1, #list do
+            local a, b, c = list[i](req, reply)
+            if a ~= nil then
+                return true, a, b, c
+            end
+        end
+        return false
+    end
+
+    local simple = #on_request == 0 and #pre_validation == 0 and #pre_handler == 0
+        and #on_send == 0 and #on_response == 0 and #on_error == 0
+        and not params_check and not query_check and not body_check and not headers_check
+        and not serialize and not wants_reply
+
+    local function prepare(req)
+        req.route = pattern
+        req.app = scope
+        local raw_query = req.query
+        if raw_query == "" then
+            req.query = EMPTY
+        else
+            req.rawquery = raw_query
+            req.query = M.decode_query(raw_query)
+        end
+        local m = req.method
+        if m ~= "GET" and m ~= "HEAD" then
+            decode_body(req)
+        end
+    end
+
+    local function handle_error(req, err)
+        for i = 1, #on_error do
+            local a, b, c = on_error[i](req, err)
+            if a ~= nil then
+                return normalize(a, b, c)
+            end
+        end
+        if getmetatable(err) == HttpError then
+            return error_response(err.status, err.message, err.details)
+        end
+        log(err)
+        return error_response(500, "internal server error")
+    end
+
+    if simple then
+        local function call(req)
+            prepare(req)
+            return handler(req)
+        end
+        return function(req)
+            local ok, a, b, c = catch call(req)
+            if not ok then
+                return handle_error(req, a)
+            end
+            local status, body, headers = normalize(a, b, c)
+            local t = type(body)
+            if t == "table" then
+                return status, tojson(body), with_type(headers, JSON_TYPE)
+            elseif t == "string" or t == "vector" then
+                return status, body, with_type(headers, TEXT_TYPE)
+            end
+            return finish(req, status, body, headers, nil)
+        end, true
+    end
+
+    local function pipeline(req)
+        local reply = wants_reply and setmetatable({}, reply_meta) or nil
+        local stop, a, b, c = run_hooks(on_request, req, reply)
+        if stop then
+            return finish(req, normalize(a, b, c), reply)
+        end
+        prepare(req)
+        stop, a, b, c = run_hooks(pre_validation, req, reply)
+        if stop then
+            return finish(req, normalize(a, b, c), reply)
+        end
+        if headers_check then
+            validate(req, headers_check, "headers", req.headers)
+        end
+        if params_check then
+            req.params = validate(req, params_check, "params", req.params)
+        end
+        if query_check then
+            req.query = validate(req, query_check, "query", req.query)
+        end
+        if body_check then
+            req.body = validate(req, body_check, "body", req.body)
+        end
+        stop, a, b, c = run_hooks(pre_handler, req, reply)
+        if stop then
+            return finish(req, normalize(a, b, c), reply)
+        end
+        local status, body, headers = normalize(handler(req, reply))
+        return finish(req, status, body, headers, reply)
+    end
+
+    return function(req)
+        local ok, status, body, headers = catch pipeline(req)
+        if ok then
+            return status, body, headers
+        end
+        return handle_error(req, status)
+    end, false
+end
+
+-- The parametric router is a tree of path segments per method. Each node has
+-- `static` children by segment text, one `param` child with its name, and an
+-- optional `wildcard` route that captures the rest of the path.
+local function tree_insert(root, path, entry)
+    local node = root
+    for segment in path:gmatch("/([^/]*)") do
+        if segment == "*" then
+            node.wildcard = entry
+            return
+        elseif segment:sub(1, 1) == ":" then
+            local name = segment:sub(2)
+            local child = node.param
+            if child == nil then
+                child = { static = {}, name = name }
+                node.param = child
+            elseif child.name ~= name then
+                error(`route '$path' names parameter '$name' where another route names '$(child.name)'`, 0)
+            end
+            node = child
+        else
+            local child = node.static[segment]
+            if child == nil then
+                child = { static = {} }
+                node.static[segment] = child
+            end
+            node = child
+        end
+    end
+    node.entry = entry
+end
+
+local function split_path(path)
+    local segments, n = {}, 0
+    for segment in path:gmatch("/([^/]*)") do
+        n = n + 1
+        segments[n] = segment
+    end
+    return segments, n
+end
+
+local function tree_match(node, segments, i, n, params)
+    if i > n then
+        if node.entry then
+            return node.entry
+        end
+        if node.wildcard then
+            params["*"] = ""
+            return node.wildcard
+        end
+        return nil
+    end
+    local segment = segments[i]
+    local child = node.static[segment]
+    if child then
+        local found = tree_match(child, segments, i + 1, n, params)
+        if found then
+            return found
+        end
+    end
+    child = node.param
+    if child and segment ~= "" then
+        local found = tree_match(child, segments, i + 1, n, params)
+        if found then
+            params[child.name] = decode_param(segment)
+            return found
+        end
+    end
+    if node.wildcard then
+        local rest = {}
+        for j = i, n do
+            rest[#rest + 1] = segments[j]
+        end
+        params["*"] = decode_param(table.concat(rest, "/"))
+        return node.wildcard
+    end
+    return nil
+end
+
+local function compile_app(app)
+    local static, trees, allowed = {}, {}, {}
+    local static_simple = {}
+    for _, route in ipairs(app.routes) do
+        local fn = compile_route(app, route)
+        local method, path = route.method, route.path
+        if path:find("/[:*]") then
+            local tree = trees[method]
+            if tree == nil then
+                tree = { static = {} }
+                trees[method] = tree
+            end
+            tree_insert(tree, path, fn)
+        else
+            local by_path = static[method]
+            if by_path == nil then
+                by_path = {}
+                static[method] = by_path
+            end
+            if by_path[path] == nil then
+                by_path[path] = fn
+            end
+        end
+        allowed[#allowed + 1] = route
+    end
+    -- HEAD falls back to GET.
+    if static.GET then
+        static.HEAD = setmetatable(static.HEAD or {}, { __index = static.GET })
+    end
+    if trees.GET and not trees.HEAD then
+        trees.HEAD = trees.GET
+    end
+
+    local not_found = app.not_found_handler
+    local nf_route
+    if not_found then
+        nf_route = compile_route(app, { handler = not_found, options = {}, scope = app, path = "*" })
+    end
+
+    local function allow_list(path)
+        local list = {}
+        for _, method in ipairs(METHODS) do
+            local by_path = static[method]
+            local hit = by_path and by_path[path]
+            if not hit and trees[method] then
+                local segments, n = split_path(path)
+                hit = tree_match(trees[method], segments, 1, n, {})
+            end
+            if hit then
+                list[#list + 1] = method
+            end
+        end
+        return list
+    end
+
+    return function(req)
+        local method, path = req.method, req.path
+        local by_path = static[method]
+        if by_path then
+            local fn = by_path[path]
+            if fn then
+                req.params = EMPTY
+                return fn(req)
+            end
+        end
+        local tree = trees[method]
+        if tree then
+            local segments, n = split_path(path)
+            local params = {}
+            local fn = tree_match(tree, segments, 1, n, params)
+            if fn then
+                req.params = params
+                return fn(req)
+            end
+        end
+        if nf_route then
+            req.params = EMPTY
+            return nf_route(req)
+        end
+        local allow = allow_list(path)
+        if #allow > 0 then
+            local status, body, headers = error_response(405, "method not allowed")
+            return status, body, { ["Content-Type"] = JSON_TYPE, Allow = table.concat(allow, ", ") }
+        end
+        return error_response(404, "not found")
+    end
+end
+
+--- Returns the request handler of the application for `network.serve`.
+---
+--- The routes are compiled on the first call. Routes added afterward compile
+--- on the next call.
+--- @return function
+function Scope:handler()
+    local app = self.root
+    local compiled = app.compiled
+    if compiled == nil then
+        compiled = compile_app(app)
+        app.compiled = compiled
+    end
+    return compiled
+end
+
+--- Serves the application with `network.serve`.
+---
+--- The call returns when the server stops. The arguments are those of
+--- `network.serve` without the handler: a host and a port, or a server that
+--- `network.tcp.bind` returned. `options` is passed to `network.serve`.
+--- @param host string|userdata The host, or a bound server.
+--- @param port integer|table? The port, or the options when `host` is a server.
+--- @param options table? The options of `network.serve`.
+function Scope:listen(host, port, options)
+    local handler = self:handler()
+    if type(host) == "string" then
+        return network.serve(host, port, handler, options)
+    end
+    return network.serve(host, handler, port)
+end
+
+local Response = {}
+Response.__index = Response
+
+--- Decodes the body of an injected response as JSON.
+--- @return any
+function Response:json()
+    return fromjson(self.body)
+end
+
+--- Answers a request in memory, without a socket.
+---
+--- `request` has the fields `method` (default `"GET"`), `path`, which may
+--- carry a query string, `headers`, and `body`, a string or a table that is
+--- sent as JSON. The result has `status`, `body` as a string, `headers`
+--- with lowercase names, and the method `json()`.
+--- @param request table The request.
+--- @return table The response.
+function Scope:inject(request)
+    local handler = self:handler()
+    local path, query = request.path or "/", ""
+    local q = path:find("?", 1, true)
+    if q then
+        path, query = path:sub(1, q - 1), path:sub(q + 1)
+    end
+    local headers = {}
+    for k, v in pairs(request.headers or {}) do
+        headers[k:lower()] = tostring(v)
+    end
+    local body = request.body
+    if type(body) == "table" then
+        body = tojson(body)
+        headers["content-type"] = headers["content-type"] or "application/json"
+    end
+    local req = {
+        method = (request.method or "GET"):upper(),
+        path = path,
+        query = query,
+        headers = headers,
+        body = vector.fromstring(body or ""),
+    }
+    local ok, status, out, out_headers = catch handler(req)
+    if not ok then
+        status, out, out_headers = 500, "", nil
+    end
+    local lower = {}
+    for k, v in pairs(out_headers or {}) do
+        lower[k:lower()] = v
+    end
+    if type(out) == "vector" then
+        out = vector.tostring(out)
+    end
+    if req.method == "HEAD" then
+        out = ""
+    end
+    return setmetatable({ status = status or 200, body = out or "", headers = lower }, Response)
+end
+
+return M
