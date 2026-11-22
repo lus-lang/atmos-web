@@ -11,11 +11,11 @@ local port = tonumber(arg[1]) or 8080
 local counter = 0
 
 local app = web.app()
-app:get("/", function(req)
+app:get("/", function(_req)
     counter = counter + 1
     return { message = "hello", n = counter }
 end)
-app:not_found(function(req)
+app:not_found(function(_req)
     return 404, "not found\n"
 end)
 

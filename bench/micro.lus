@@ -12,13 +12,13 @@ local function bare(req)
     end
 end
 local app = web.app()
-app:get("/", function(req) counter = counter + 1 return { message = "hello", n = counter } end)
+app:get("/", function(_req) counter = counter + 1 return { message = "hello", n = counter } end)
 local h = app:handler()
 local headers = { host = "x" }
 local function run(name, f)
     local body = vector.create(0)
     local t = os.clock()
-    for i = 1, N do
+    for _i = 1, N do
         f({ method = "GET", path = "/", query = "", headers = headers, body = body })
     end
     print(name, string.format("%.3f us/req", (os.clock() - t) / N * 1e6))

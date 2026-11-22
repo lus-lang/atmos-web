@@ -17,7 +17,7 @@
 local M = {}
 
 local type, math_type, tostring, setmetatable, getmetatable = type, math.type, tostring, setmetatable, getmetatable
-local pairs, ipairs, next = pairs, ipairs, next
+local pairs, ipairs = pairs, ipairs
 local tojson, fromjson = tojson, fromjson
 
 local JSON_TYPE = "application/json; charset=utf-8"
@@ -77,6 +77,12 @@ local function unescape(text)
         return text
     end
     text = text:gsub("+", " ")
+    -- Percent escapes are UTF-8 bytes. Text that does not decode to valid
+    -- UTF-8 falls back to one character per escaped byte.
+    local ok, decoded = catch string.transcode(text, "url", "utf-8")
+    if ok then
+        return decoded
+    end
     return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
 end
 
@@ -113,6 +119,12 @@ end
 local function decode_param(text)
     if text:find("%", 1, true) == nil then
         return text
+    end
+    -- Percent escapes are UTF-8 bytes, as in `unescape`. A `+` stays a plus
+    -- sign in a path, so it is escaped before the URL decoding.
+    local ok, decoded = catch string.transcode((text:gsub("+", "%%2B")), "url", "utf-8")
+    if ok then
+        return decoded
     end
     return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
 end
@@ -350,6 +362,13 @@ function Scope:all(path, options, handler)
 end
 
 --- Adds a hook to this scope and the scopes registered from it.
+---
+--- `on_send` hooks receive `req, status, body, headers` and return the
+--- three values of the response. `on_response` hooks receive `req, status`
+--- after them. Both run for every response of the scope, including the
+--- response to an error that a handler or a hook raised. The hooks of the
+--- application also run for a request that matches no route, which is
+--- answered with 404 or 405.
 --- @param name string One of `on_request`, `pre_validation`, `pre_handler`, `on_send`, `on_response`, and `on_error`.
 --- @param fn function The hook.
 --- @return table The scope, for chaining.
@@ -431,8 +450,7 @@ local function scope_hooks(scope, name, route_options)
     end
     local out = {}
     for _, sc in ipairs(chain) do
-        local list = sc.hooks[name]
-        if list then
+        if list = sc.hooks[name] then
             for _, fn in ipairs(list) do
                 out[#out + 1] = fn
             end
@@ -553,7 +571,7 @@ local function compile_route(app, route)
         return status, body, headers
     end
 
-    local function validate(req, schema, where, value)
+    local function validate(_req, schema, where, value)
         local ok, parsed = schema:check(value)
         if not ok then
             M.raise(400, `invalid $where`, issues_body(where, parsed))
@@ -592,11 +610,15 @@ local function compile_route(app, route)
         end
     end
 
-    local function handle_error(req, err)
+    local function error_result(req, err)
         for i = 1, #on_error do
             local a, b, c = on_error[i](req, err)
             if a ~= nil then
-                return normalize(a, b, c)
+                local status, body, headers = normalize(a, b, c)
+                if type(body) == "table" then
+                    return status, tojson(body), with_type(headers, JSON_TYPE)
+                end
+                return status, body, headers
             end
         end
         if getmetatable(err) == HttpError then
@@ -604,6 +626,35 @@ local function compile_route(app, route)
         end
         log(err)
         return error_response(500, "internal server error")
+    end
+
+    local has_after = #on_send > 0 or #on_response > 0
+
+    local function after(req, status, body, headers)
+        for i = 1, #on_send do
+            status, body, headers = on_send[i](req, status, body, headers)
+        end
+        for i = 1, #on_response do
+            on_response[i](req, status)
+        end
+        return status, body, headers
+    end
+
+    -- Answers a request whose handler or hooks raised an error. The
+    -- `on_send` and `on_response` hooks see the error response like any
+    -- other. When one of them raises an error here, the error response
+    -- goes out as it was before the hooks.
+    local function handle_error(req, err)
+        local status, body, headers = error_result(req, err)
+        if not has_after then
+            return status, body, headers
+        end
+        local ok, a, b, c = catch after(req, status, body, headers)
+        if ok then
+            return a, b, c
+        end
+        log(a)
+        return status, body, headers
     end
 
     if simple then
@@ -627,16 +678,22 @@ local function compile_route(app, route)
         end, true
     end
 
+    -- Answers a request that a hook stopped with its own response.
+    local function stopped(req, reply, a, b, c)
+        local status, body, headers = normalize(a, b, c)
+        return finish(req, status, body, headers, reply)
+    end
+
     local function pipeline(req)
         local reply = wants_reply and setmetatable({}, reply_meta) or nil
         local stop, a, b, c = run_hooks(on_request, req, reply)
         if stop then
-            return finish(req, normalize(a, b, c), reply)
+            return stopped(req, reply, a, b, c)
         end
         prepare(req)
         stop, a, b, c = run_hooks(pre_validation, req, reply)
         if stop then
-            return finish(req, normalize(a, b, c), reply)
+            return stopped(req, reply, a, b, c)
         end
         if headers_check then
             validate(req, headers_check, "headers", req.headers)
@@ -652,7 +709,7 @@ local function compile_route(app, route)
         end
         stop, a, b, c = run_hooks(pre_handler, req, reply)
         if stop then
-            return finish(req, normalize(a, b, c), reply)
+            return stopped(req, reply, a, b, c)
         end
         local status, body, headers = normalize(handler(req, reply))
         return finish(req, status, body, headers, reply)
@@ -721,15 +778,13 @@ local function tree_match(node, segments, i, n, params)
     local segment = segments[i]
     local child = node.static[segment]
     if child then
-        local found = tree_match(child, segments, i + 1, n, params)
-        if found then
+        if found = tree_match(child, segments, i + 1, n, params) then
             return found
         end
     end
     child = node.param
     if child and segment ~= "" then
-        local found = tree_match(child, segments, i + 1, n, params)
-        if found then
+        if found = tree_match(child, segments, i + 1, n, params) then
             params[child.name] = decode_param(segment)
             return found
         end
@@ -747,10 +802,9 @@ end
 
 local function compile_app(app)
     local static, trees, allowed = {}, {}, {}
-    local static_simple = {}
     for _, route in ipairs(app.routes) do
         local fn = compile_route(app, route)
-        local method, path = route.method, route.path
+        local method, path from route
         if path:find("/[:*]") then
             local tree = trees[method]
             if tree == nil then
@@ -778,12 +832,6 @@ local function compile_app(app)
         trees.HEAD = trees.GET
     end
 
-    local not_found = app.not_found_handler
-    local nf_route
-    if not_found then
-        nf_route = compile_route(app, { handler = not_found, options = {}, scope = app, path = "*" })
-    end
-
     local function allow_list(path)
         local list = {}
         for _, method in ipairs(METHODS) do
@@ -800,22 +848,38 @@ local function compile_app(app)
         return list
     end
 
+    local function builtin_not_found(req)
+        local allow = allow_list(req.path)
+        if #allow > 0 then
+            local status, body = error_response(405, "method not allowed")
+            return status, body, { ["Content-Type"] = JSON_TYPE, Allow = table.concat(allow, ", ") }
+        end
+        return error_response(404, "not found")
+    end
+
+    -- A request that matches no route runs as a route of the application
+    -- scope, so the hooks of the application see its response. An
+    -- application without hooks answers it directly.
+    local not_found = app.not_found_handler
+    local nf_route
+    if not_found then
+        nf_route = compile_route(app, { handler = not_found, options = {}, scope = app, path = "*" })
+    elseif next(app.hooks) ~= nil then
+        nf_route = compile_route(app, { handler = function(req) return builtin_not_found(req) end, options = {}, scope = app, path = "*" })
+    end
+
     return function(req)
-        local method, path = req.method, req.path
-        local by_path = static[method]
-        if by_path then
-            local fn = by_path[path]
-            if fn then
+        local method, path from req
+        if by_path = static[method] then
+            if fn = by_path[path] then
                 req.params = EMPTY
                 return fn(req)
             end
         end
-        local tree = trees[method]
-        if tree then
+        if tree = trees[method] then
             local segments, n = split_path(path)
             local params = {}
-            local fn = tree_match(tree, segments, 1, n, params)
-            if fn then
+            if fn = tree_match(tree, segments, 1, n, params) then
                 req.params = params
                 return fn(req)
             end
@@ -824,12 +888,7 @@ local function compile_app(app)
             req.params = EMPTY
             return nf_route(req)
         end
-        local allow = allow_list(path)
-        if #allow > 0 then
-            local status, body, headers = error_response(405, "method not allowed")
-            return status, body, { ["Content-Type"] = JSON_TYPE, Allow = table.concat(allow, ", ") }
-        end
-        return error_response(404, "not found")
+        return builtin_not_found(req)
     end
 end
 
@@ -873,19 +932,34 @@ function Response:json()
     return fromjson(self.body)
 end
 
+--- Returns the exact bytes of the body of an injected response.
+---
+--- Use it for a body that is not text, such as an image or a part of a
+--- file.
+--- @return vector
+function Response:bytes()
+    local raw = self.raw
+    if type(raw) ~= "vector" then
+        raw = vector.fromstring(raw)
+        self.raw = raw
+    end
+    return raw
+end
+
 --- Answers a request in memory, without a socket.
 ---
 --- `request` has the fields `method` (default `"GET"`), `path`, which may
 --- carry a query string, `headers`, and `body`, a string or a table that is
 --- sent as JSON. The result has `status`, `body` as a string, `headers`
---- with lowercase names, and the method `json()`.
+--- with lowercase names, and the methods `json()` and `bytes()`. Bytes of
+--- the body that are not valid UTF-8 appear in `body` as U+FFFD, and
+--- `bytes()` returns the body as a vector, byte for byte.
 --- @param request table The request.
 --- @return table The response.
 function Scope:inject(request)
     local handler = self:handler()
     local path, query = request.path or "/", ""
-    local q = path:find("?", 1, true)
-    if q then
+    if q = path:find("?", 1, true) then
         path, query = path:sub(1, q - 1), path:sub(q + 1)
     end
     local headers = {}
@@ -912,13 +986,15 @@ function Scope:inject(request)
     for k, v in pairs(out_headers or {}) do
         lower[k:lower()] = v
     end
-    if type(out) == "vector" then
-        out = vector.tostring(out)
-    end
-    if req.method == "HEAD" then
+    if req.method == "HEAD" or out == nil then
         out = ""
     end
-    return setmetatable({ status = status or 200, body = out or "", headers = lower }, Response)
+    local text = out
+    if type(out) == "vector" then
+        local valid, decoded = catch vector.tostring(out)
+        text = valid and decoded or vector.tostring(out, 0, #out, "lossy")
+    end
+    return setmetatable({ status = status or 200, body = text, raw = out, headers = lower }, Response)
 end
 
 return M
