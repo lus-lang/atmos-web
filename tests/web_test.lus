@@ -419,3 +419,238 @@ local function inject_binary_body_test()
     assert(app:inject({ path = "/vector-text" }).body == "héllo")
     assert(#app:inject({ method = "HEAD", path = "/bin" }):bytes() == 0)
 end
+
+local function client_address_test()
+    local app = web.app()
+    app:get("/who", function(req) return { ip = req.ip, port = req.port } end)
+    local who = app:inject({ path = "/who" }):json()
+    assert(who.ip == "127.0.0.1" and who.port == 0)
+    who = app:inject({ path = "/who", ip = "203.0.113.7", port = 4431 }):json()
+    assert(who.ip == "203.0.113.7" and who.port == 4431)
+end
+
+local function client_address_over_the_wire_test()
+    local app = web.app()
+    app:get("/who", function(req) return { ip = req.ip, port = req.port } end)
+    local response = serve_once(app, "GET /who HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n")
+    local who = fromjson(response:match("\r\n\r\n(.*)$"))
+    assert(who.ip == "127.0.0.1")
+    assert(math.type(who.port) == "integer" and who.port > 0)
+end
+
+local function lazy_body_test()
+    local app = web.app()
+    local seen
+    app:post("/ignore", { body_read = "lazy" }, function(_req) return "ignored" end)
+    app:post("/read", { body_read = "lazy" }, function(req) return { name = req.body.name, size = #req.raw } end)
+    app:post("/raw-first", { body_read = "lazy" }, function(req)
+        local size = #req.raw
+        return { size = size, name = req.body.name }
+    end)
+    app:post("/empty", { body_read = "lazy" }, function(req)
+        seen = { body = req.body, raw = req.raw }
+        return 204
+    end)
+    app:post("/bytes", { body_read = "lazy" }, function(req) return { kind = type(req.body), same = req.body == req.raw } end)
+    local broken = { method = "POST", headers = { ["Content-Type"] = "application/json" }, body = "{nope" }
+    -- A route that never reads the body never decodes it.
+    broken.path = "/ignore"
+    assert(app:inject(broken).body == "ignored")
+    broken.path = "/read"
+    assert(app:inject(broken).status == 400)
+    local res = app:inject({ method = "POST", path = "/read", body = { name = "lus" } })
+    assert(res:json().name == "lus" and res:json().size == 14)
+    res = app:inject({ method = "POST", path = "/raw-first", body = { name = "lus" } })
+    assert(res:json().name == "lus" and res:json().size == 14)
+    assert(app:inject({ method = "POST", path = "/empty" }).status == 204)
+    assert(seen.body == nil and #seen.raw == 0)
+    res = app:inject({ method = "POST", path = "/bytes", body = "\1\2", headers = { ["Content-Type"] = "application/octet-stream" } })
+    assert(res:json().kind == "vector" and res:json().same)
+end
+
+local function reader_test()
+    local messages = {}
+    local app = web.app({ log = function(message) messages[#messages + 1] = tostring(message) end })
+    app:post("/upload", { body_read = "lazy" }, function(req)
+        local size = 0
+        for line in network.lines(req.reader) do
+            size = size + #line
+        end
+        return { size = size }
+    end)
+    app:post("/both", { body_read = "lazy" }, function(req)
+        coroutine.resume(req.reader)
+        return { body = req.body }
+    end)
+    local res = app:inject({ method = "POST", path = "/upload", body = "ab\ncd\n", headers = { ["Content-Type"] = "application/json" } })
+    assert(res:json().size == 4)
+    assert(app:inject({ method = "POST", path = "/upload" }):json().size == 0)
+    assert(app:inject({ method = "POST", path = "/both", body = "x" }).status == 500)
+    assert(messages[1]:find("already read through req.reader", 1, true))
+end
+
+local function upload_over_the_wire_test()
+    local app = web.app()
+    app:put("/files/:name", { body_read = "lazy" }, function(req)
+        local parts, size = 0, 0
+        local reader = req.reader
+        while true do
+            local ok, part = coroutine.resume(reader)
+            assert(ok, part)
+            if part == nil then break end
+            parts = parts + 1
+            size = size + #part
+        end
+        return { name = req.params.name, size = size, parts = parts > 0 }
+    end)
+    app:post("/json", function(req) return { name = req.body.name, raw = #req.raw } end)
+    app:post("/ignore", { body_read = "lazy" }, function(_req) return "ignored" end)
+    local response = serve_once(app, "PUT /files/a.bin HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+    local got = fromjson(response:match("\r\n\r\n(.*)$"))
+    assert(got.name == "a.bin" and got.size == 11 and got.parts)
+    response = serve_once(app, "POST /json HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}")
+    got = fromjson(response:match("\r\n\r\n(.*)$"))
+    assert(got.name == "lus" and got.raw == 14)
+    response = serve_once(app, "POST /ignore HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Content-Type: application/json\r\nContent-Length: 5\r\n\r\n{nope")
+    assert(response:match("\r\n\r\n(.*)$") == "ignored")
+end
+
+local function refused_body_test()
+    local app = web.app()
+    app:post("/big", { body_read = "lazy" }, function(req) return { size = #req.raw } end)
+    local response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Content-Length: 20000000\r\n\r\n")
+    assert(response:match("^HTTP/1.1 (%d+)") == "413")
+    assert(fromjson(response:match("\r\n\r\n(.*)$")).error == "request body too large")
+end
+
+local function stream_test()
+    local app = web.app()
+    local sent
+    app:hook("on_send", function(_req, status, body, headers)
+        sent = type(body)
+        return status, body, headers
+    end)
+    app:get("/events", function(_req)
+        return 200, coroutine.create(function()
+            coroutine.yield("data: 1\n\n")
+            coroutine.yield(vector.fromstring("data: 2\n\n"))
+            return "data: 3\n\n"
+        end), { ["Content-Type"] = "text/event-stream" }
+    end)
+    app:get("/lines", function(_req, reply)
+        reply:type("text/csv")
+        local n = 0
+        return function()
+            n = n + 1
+            if n <= 2 then return `row $n\n` end
+        end
+    end)
+    app:get("/broken", function(_req)
+        return coroutine.create(function()
+            coroutine.yield("partial")
+            error("stream failed", 0)
+        end)
+    end)
+    local res = app:inject({ path = "/events" })
+    assert(res.status == 200 and sent == "thread")
+    assert(res.body == "data: 1\n\ndata: 2\n\ndata: 3\n\n")
+    assert(#res.chunks == 3 and res.chunks[1] == "data: 1\n\n")
+    assert(res.headers["content-type"] == "text/event-stream")
+    assert(#res:bytes() == 27)
+    res = app:inject({ path = "/lines" })
+    assert(sent == "function" and res.body == "row 1\nrow 2\n")
+    assert(res.headers["content-type"] == "text/csv")
+    assert(app:inject({ path = "/" }).chunks == nil)
+    res = app:inject({ method = "HEAD", path = "/events" })
+    assert(res.status == 200 and res.body == "" and res.chunks == nil)
+    raises(function() app:inject({ path = "/broken" }) end, "stream failed")
+end
+
+local function stream_over_the_wire_test()
+    pledge("network")
+    local app = web.app()
+    app:get("/events", function(_req)
+        return 200, coroutine.create(function()
+            for n = 1, 3 do
+                coroutine.yield(`data: $n\n\n`)
+            end
+        end), { ["Content-Type"] = "text/event-stream" }
+    end)
+    app:post("/echo", { body_read = "lazy" }, function(req) return 200, req.reader end)
+    local server = network.tcp.bind("127.0.0.1", 0)
+    local _, port = server:getsockname()
+    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+    local status, events, headers = network.fetch(`http://127.0.0.1:$port/events`, "GET", nil, nil, { stream = true })
+    assert(status == 200 and headers["content-type"] == "text/event-stream")
+    assert(headers["transfer-encoding"] == "chunked")
+    local seen = {}
+    for line in network.lines(events) do
+        if #line > 0 then
+            seen[#seen + 1] = vector.tostring(line)
+        end
+    end
+    assert(table.concat(seen, ",") == "data: 1,data: 2,data: 3")
+    local _, echoed = network.fetch(`http://127.0.0.1:$port/echo`, "POST", nil, "sent back")
+    assert(vector.tostring(echoed) == "sent back")
+    coroutine.close(serving)
+    server:close()
+end
+
+local function body_read_test()
+    local app = web.app()
+    local function fields(req)
+        return { name = req.body and req.body.name, raw = req.raw and #req.raw, stored = rawget(req, "body") ~= nil }
+    end
+    app:post("/eager", { body_read = "eager" }, function(req)
+        local stored = rawget(req, "body") ~= nil and rawget(req, "raw") ~= nil
+        local out = fields(req)
+        out.before = stored
+        return out
+    end)
+    app:post("/lazy", { body_read = "lazy" }, function(req)
+        local stored = rawget(req, "body") ~= nil or rawget(req, "raw") ~= nil
+        local out = fields(req)
+        out.before = stored
+        return out
+    end)
+    app:post("/schema", { body = s.object({ name = s.string() }) }, function(req)
+        return { before = rawget(req, "raw") ~= nil, name = req.body.name }
+    end)
+    app:post("/eager-ignore", { body_read = "eager" }, function(_req) return "ignored" end)
+    local got = app:inject({ method = "POST", path = "/eager", body = { name = "lus" } }):json()
+    assert(got.before and got.name == "lus" and got.raw == 14)
+    got = app:inject({ method = "POST", path = "/lazy", body = { name = "lus" } }):json()
+    -- The first use stores the decoded body and its bytes in the request.
+    assert(not got.before and got.name == "lus" and got.raw == 14 and got.stored)
+    got = app:inject({ method = "POST", path = "/schema", body = { name = "lus" } }):json()
+    assert(got.before and got.name == "lus")
+    assert(app:inject({ method = "POST", path = "/eager" }):json().before == false)
+    -- An eager route decodes a body that its handler ignores.
+    local broken = { method = "POST", path = "/eager-ignore", headers = { ["Content-Type"] = "application/json" }, body = "{nope" }
+    assert(app:inject(broken).status == 400)
+    local quiet = web.app({ log = function() end })
+    quiet:post("/eager-reader", { body_read = "eager" }, function(req) return 200, req.reader end)
+    assert(quiet:inject({ method = "POST", path = "/eager-reader", body = "x" }).status == 500)
+    local bad = web.app()
+    bad:post("/", { body_read = "sometimes" }, function() end)
+    raises(function() bad:handler() end, "body_read must be 'eager' or 'lazy'")
+end
+
+local function eager_refused_body_test()
+    local app = web.app()
+    app:post("/big", { body_read = "eager" }, function(req) return { size = #req.raw } end)
+    local response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Content-Length: 20000000\r\n\r\n")
+    assert(response:match("^HTTP/1.1 (%d+)") == "413")
+    response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Transfer-Encoding: chunked\r\n\r\nzz\r\n")
+    assert(response:match("^HTTP/1.1 (%d+)") == "400")
+    assert(fromjson(response:match("\r\n\r\n(.*)$")).error == "invalid request body")
+    response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+        .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}")
+    assert(fromjson(response:match("\r\n\r\n(.*)$")).size == 14)
+end

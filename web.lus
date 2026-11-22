@@ -281,6 +281,29 @@ end
 --- `options.log` is a function that receives error messages. By default it
 --- writes them to standard error.
 ---
+--- A handler receives the request table of `network.serve`, so `req.ip`
+--- and `req.port` hold the address of the client. For a method other than
+--- `GET` and `HEAD`, the framework reads the body before the handler runs
+--- and decodes it by its `Content-Type`: JSON into a value, a URL-encoded form into a
+--- table, and `text/*` into a string. A body of another type stays a
+--- vector. An empty body is `nil`. `req.raw` holds the bytes of the
+--- body. A route with the option `body_read = "lazy"` reads and decodes
+--- the body on the first use of `req.body` or `req.raw` instead, which
+--- spares a route that never looks at the body the cost of reading it and
+--- leaves `req.reader` free for a handler that streams an upload. A body that
+--- `network.serve` refuses while it reads, such as one over 16 MiB, is
+--- answered with the status of the refusal, such as 413.
+--- `req.reader` is the coroutine of `network.serve` that yields the body
+--- part by part as it arrives, which suits an upload that a handler writes
+--- to a file. A request is read either whole or part by part, so the use
+--- of one of the two fields after the other raises an error.
+---
+--- A handler streams its response by returning a coroutine or a function
+--- as the body. `network.serve` sends each chunk that the coroutine yields
+--- or that the function returns, until the coroutine ends or the function
+--- returns `nil`. The stream reaches the `on_send` hooks and
+--- `network.serve` unchanged, without a default `Content-Type`.
+---
 --- A handler upgrades a connection, as WebSocket does, by returning `101`,
 --- a function, and optionally headers. `network.serve` sends the 101
 --- response, then calls the function with the TCP socket of the connection.
@@ -313,7 +336,10 @@ end
 ---
 --- The optional `options` table holds the schemas `params`, `query`,
 --- `body`, `headers`, and `response`, along with per-route hooks under the
---- hook names. `response` is a schema or a table from status codes to
+--- hook names. `body_read` is `"eager"` to read and decode the request body
+--- before the handler runs, or `"lazy"` to do so on the first use of
+--- `req.body` or `req.raw`. It defaults to `"eager"`, and a route with a
+--- `body` schema always reads eagerly. `response` is a schema or a table from status codes to
 --- schemas. When `handler` is omitted, the third argument is the handler.
 --- @param method string|table The method, a list of methods, or `"*"`.
 --- @param path string The path pattern.
@@ -371,11 +397,13 @@ end
 --- Adds a hook to this scope and the scopes registered from it.
 ---
 --- `on_send` hooks receive `req, status, body, headers` and return the three
---- values of the response. `on_response` hooks run after them and receive
---- `req, status`. Both run for every response of the scope, including the
---- response to an error that a handler or a hook raised. The hooks of the
---- application also run for a request that matches no route, which is
---- answered with 404 or 405.
+--- values of the response. The body is a string or a vector, or the
+--- coroutine or the function of a streamed response, which a hook that
+--- reads bodies must pass on unread. `on_response` hooks run after them
+--- and receive `req, status`. Both run for every response of the scope,
+--- including the response to an error that a handler or a hook raised. The
+--- hooks of the application also run for a request that matches no route,
+--- which is answered with 404 or 405.
 --- @param name string One of `on_request`, `pre_validation`, `pre_handler`, `on_send`, `on_response`, and `on_error`.
 --- @param fn function The hook.
 --- @return table The scope, for chaining.
@@ -488,12 +516,26 @@ local function issues_body(where, err)
     return list
 end
 
-local function decode_body(req)
-    local raw = req.body
-    req.raw = raw
-    if raw == nil or vector.size(raw) == 0 then
-        req.body = nil
-        return
+-- Returns the status and the message that answer the error of a request
+-- body that `network.serve` refused while it read, or nil for any other
+-- error.
+local function body_refusal(err)
+    if err:find("request body too large", 1, true) or err:find("framing too large", 1, true) then
+        return 413, "request body too large"
+    elseif err:find("invalid request body: ", 1, true) then
+        if err:find("trailers too large", 1, true) then
+            return 431, "request body trailers too large"
+        elseif err:find("request timeout", 1, true) then
+            return 408, "request timeout"
+        end
+        return 400, "invalid request body"
+    end
+    return nil
+end
+
+local function decode_body(req, raw)
+    if raw == nil or #raw == 0 then
+        return nil
     end
     local ctype = req.headers["content-type"] or ""
     if ctype:find("json", 1, true) then
@@ -501,12 +543,79 @@ local function decode_body(req)
         if not ok then
             M.raise(400, "invalid JSON body")
         end
-        req.body = value
+        return value
     elseif ctype:find("application/x-www-form-urlencoded", 1, true) then
-        req.body = M.decode_query(vector.tostring(raw))
+        return M.decode_query(vector.tostring(raw))
     elseif ctype:find("text/", 1, true) then
-        req.body = vector.tostring(raw)
+        return vector.tostring(raw)
     end
+    return raw
+end
+
+-- Returns a metatable that reads and decodes the body of a request on the
+-- first use of `req.body` or `req.raw`. `inner` is the `__index` that the
+-- request had, which reads the fields `body` and `reader` of a request of
+-- `network.serve` from the connection. Every other key goes to `inner`.
+local function lazy_meta(inner)
+    if type(inner) == "table" then
+        local fields = inner
+        inner = function(_req, key) return fields[key] end
+    end
+    return {
+        __index = function(req, key)
+            if key == "body" then
+                local raw = rawget(req, "raw")
+                if raw == nil and inner then
+                    raw = inner(req, "body")
+                    rawset(req, "raw", raw)
+                end
+                -- `inner` may have stored the bytes as `req.body`, which
+                -- holds the decoded value from here on.
+                local value = decode_body(req, raw)
+                rawset(req, "body", value)
+                return value
+            elseif key == "raw" then
+                local raw = inner and inner(req, "body")
+                rawset(req, "body", nil)
+                rawset(req, "raw", raw)
+                return raw
+            elseif inner then
+                return inner(req, key)
+            end
+        end,
+    }
+end
+
+local PLAIN_META = lazy_meta(nil)
+-- `network.serve` gives the requests of one connection one metatable, so
+-- the lazy metatable is built once for each connection.
+local lazy_metas = setmetatable({}, { __mode = "k" })
+
+-- Reads and decodes the body of a request at once.
+local function eager_body(req)
+    local raw = req.body
+    req.raw = raw
+    req.body = decode_body(req, raw)
+end
+
+-- Defers the body of a request to the first use of `req.body`.
+local function lazy_body(req)
+    local raw = rawget(req, "body")
+    if raw ~= nil then
+        req.raw = raw
+        req.body = nil
+    end
+    local mt = getmetatable(req)
+    if mt == nil then
+        return setmetatable(req, PLAIN_META)
+    end
+    local lazy = lazy_metas[mt]
+    if lazy == nil then
+        lazy = lazy_meta(mt.__index)
+        lazy_metas[mt] = lazy
+        lazy_metas[lazy] = lazy
+    end
+    return setmetatable(req, lazy)
 end
 
 local function serializers(response)
@@ -543,6 +652,11 @@ local function compile_route(app, route)
     local body_check = options.body
     local headers_check = options.headers
     local serialize = serializers(options.response)
+    local body_read = body_check and "eager" or options.body_read or "eager"
+    if body_read ~= "eager" and body_read ~= "lazy" then
+        error(`route '$(route.path)': body_read must be 'eager' or 'lazy'`, 0)
+    end
+    local read_body = body_read == "eager" and eager_body or lazy_body
     local pattern = route.path
     local reply_meta = app.reply_meta
     local log = app.log
@@ -559,6 +673,9 @@ local function compile_route(app, route)
             -- An upgrade: network.serve sends the 101 response and calls the
             -- function with the socket of the connection.
             return status, body, headers
+        elseif t == "thread" or t == "function" then
+            -- A stream: network.serve resumes the coroutine or calls the
+            -- function for each chunk, so the value goes out as it is.
         elseif t == "table" then
             local encode = serialize and (serialize[status] or serialize.default) or tojson
             body = encode(body)
@@ -615,7 +732,7 @@ local function compile_route(app, route)
         end
         local m = req.method
         if m ~= "GET" and m ~= "HEAD" then
-            decode_body(req)
+            read_body(req)
         end
     end
 
@@ -632,6 +749,12 @@ local function compile_route(app, route)
         end
         if getmetatable(err) == HttpError then
             return error_response(err.status, err.message, err.details)
+        end
+        if type(err) == "string" then
+            local status, message = body_refusal(err)
+            if status then
+                return error_response(status, message)
+            end
         end
         log(err)
         return error_response(500, "internal server error")
@@ -955,14 +1078,103 @@ function Response:bytes()
     return raw
 end
 
+-- Gives an injected request the fields `body` and `reader` of a request of
+-- `network.serve`, which exist from their first use and exclude each other.
+local function inject_meta(bytes)
+    local whole, started = false, false
+    return {
+        __index = function(req, key)
+            if key == "body" then
+                if started then
+                    error("the request body was already read through req.reader", 2)
+                end
+                whole = true
+                rawset(req, "body", bytes)
+                return bytes
+            elseif key == "reader" then
+                if whole then
+                    error("the request body was already read through req.body", 2)
+                end
+                local reader = coroutine.create(function()
+                    started = true
+                    if #bytes > 0 then
+                        coroutine.yield(bytes)
+                    end
+                end)
+                rawset(req, "reader", reader)
+                return reader
+            end
+        end,
+    }
+end
+
+-- Runs a streamed body to its end and returns its chunks as strings or
+-- vectors.
+local function drain(stream)
+    local chunks, n = {}, 0
+    if type(stream) == "thread" then
+        while true do
+            local ok, chunk = coroutine.resume(stream)
+            if not ok then
+                error(chunk, 0)
+            end
+            if chunk ~= nil then
+                n = n + 1
+                chunks[n] = chunk
+            end
+            if coroutine.status(stream) == "dead" then
+                break
+            end
+        end
+    else
+        for chunk in stream do
+            n = n + 1
+            chunks[n] = chunk
+        end
+    end
+    for i = 1, n do
+        local kind = type(chunks[i])
+        if kind ~= "string" and kind ~= "vector" then
+            error(`a body stream produced a $kind where a chunk is a string or a vector`, 0)
+        end
+    end
+    return chunks
+end
+
+local function join(chunks)
+    local size = 0
+    local parts = {}
+    for i, chunk in ipairs(chunks) do
+        if type(chunk) == "string" then
+            chunk = vector.fromstring(chunk)
+        end
+        parts[i] = chunk
+        size = size + #chunk
+    end
+    local out = vector.create(size)
+    local at = 0
+    for _, part in ipairs(parts) do
+        vector.copy(out, at, part, 0, #part)
+        at = at + #part
+    end
+    return out
+end
+
 --- Answers a request in memory, without a socket.
 ---
 --- `request` has the fields `method` (default `"GET"`), `path`, which may
---- carry a query string, `headers`, and `body`, a string or a table that is
---- sent as JSON. The result has `status`, `body` as a string, `headers`
---- with lowercase names, and the methods `json()` and `bytes()`. Bytes of
---- the body that are not valid UTF-8 appear in `body` as U+FFFD.
---- `bytes()` returns every byte of the body unchanged, as a vector.
+--- carry a query string, `headers`, `body`, a string, a vector, or a table
+--- that is sent as JSON, and the client address `ip` (default
+--- `"127.0.0.1"`) and `port` (default 0). The result has `status`, `body`
+--- as a string, `headers` with lowercase names, and the methods `json()`
+--- and `bytes()`. Bytes of the body that are not valid UTF-8 appear in
+--- `body` as U+FFFD. `bytes()` returns every byte of the body unchanged, as
+--- a vector.
+---
+--- A body that the route streams runs to its end, except for a `HEAD`
+--- request, which leaves it unused. `body` then holds the chunks joined,
+--- and the field `chunks` lists them in order. An error of the stream
+--- propagates from `inject`.
 --- @param request table The request.
 --- @return table The response.
 function Scope:inject(request)
@@ -980,13 +1192,17 @@ function Scope:inject(request)
         body = tojson(body)
         headers["content-type"] = headers["content-type"] or "application/json"
     end
-    local req = {
+    if type(body) ~= "vector" then
+        body = vector.fromstring(body or "")
+    end
+    local req = setmetatable({
         method = (request.method or "GET"):upper(),
         path = path,
         query = query,
         headers = headers,
-        body = vector.fromstring(body or ""),
-    }
+        ip = request.ip or "127.0.0.1",
+        port = request.port or 0,
+    }, inject_meta(body))
     local ok, status, out, out_headers = catch handler(req)
     if not ok then
         status, out, out_headers = 500, "", nil
@@ -995,15 +1211,20 @@ function Scope:inject(request)
     for k, v in pairs(out_headers or {}) do
         lower[k:lower()] = v
     end
+    local kind = type(out)
+    local chunks
     if req.method == "HEAD" or out == nil then
         out = ""
+    elseif kind == "thread" or (kind == "function" and status ~= 101) then
+        chunks = drain(out)
+        out = join(chunks)
     end
     local text = out
     if type(out) == "vector" then
         local valid, decoded = catch vector.tostring(out)
         text = valid and decoded or vector.tostring(out, 0, #out, "lossy")
     end
-    return setmetatable({ status = status or 200, body = text, raw = out, headers = lower }, Response)
+    return setmetatable({ status = status or 200, body = text, raw = out, headers = lower, chunks = chunks }, Response)
 end
 
 return M
