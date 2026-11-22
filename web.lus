@@ -1,13 +1,14 @@
---- Routes HTTP requests to handlers on top of `network.serve`.
+--- Routes HTTP requests to handlers for `network.serve`, with plugins,
+--- hooks, and schema validation.
 ---
 --- An application holds routes, hooks, and plugins. `app:listen` serves it
---- with `network.serve`, and `app:inject` answers a request in memory, which
---- is how tests call it. Routes validate their input and serialize their
---- output with schemas from the `schema` package. Any value with the
---- methods `check(value)` and `serializer()` works as a schema.
+--- with `network.serve`, while `app:inject` answers a request in memory so
+--- that tests need no socket. Routes validate their input and serialize
+--- their output with schemas from the `schema` package. Any value with the
+--- methods `check(value)` and `serializer()` is accepted as a schema.
 ---
 --- @package web
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-web
@@ -52,12 +53,13 @@ HttpError.__tostring = function(err)
     return `$(err.status) $(err.message)`
 end
 
---- Raises an error object that the framework answers with `status`.
+--- Raises an error object that the application answers with a response of
+--- status `status`.
 ---
 --- The response body is the JSON object `{ "error": message }`, with a
 --- `details` field when `details` is given.
 --- @param status integer The status of the response.
---- @param message string? The message, which defaults to the reason phrase.
+--- @param message string? The message, `"error"` by default.
 --- @param details any? More data for the client.
 function M.raise(status, message, details)
     error(setmetatable({ status = status, message = message or "error", details = details }, HttpError), 2)
@@ -72,18 +74,25 @@ end
 
 -- Query strings and forms -----------------------------------------------------------
 
-local function unescape(text)
-    if text:find("[%%+]") == nil then
-        return text
-    end
-    text = text:gsub("+", " ")
-    -- Percent escapes are UTF-8 bytes. Text that does not decode to valid
-    -- UTF-8 falls back to one character per escaped byte.
+-- Decodes percent escapes as UTF-8 bytes. A malformed escape stays as it
+-- is, and bytes that are not UTF-8 become U+FFFD, as the URL standard
+-- decodes them.
+local function percent_decode(text)
     local ok, decoded = catch string.transcode(text, "url", "utf-8")
     if ok then
         return decoded
     end
-    return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+    local bytes = string.transcode(vector.fromstring(text), "iso-8859-1", "utf-8")
+    bytes = bytes:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
+    local v = string.transcode(bytes, "utf-8", "iso-8859-1")
+    return vector.tostring(v, 0, #v, "lossy")
+end
+
+local function unescape(text)
+    if text:find("[%%+]") == nil then
+        return text
+    end
+    return percent_decode((text:gsub("+", " ")))
 end
 
 --- Decodes `a=1&b=2` into a table.
@@ -120,13 +129,8 @@ local function decode_param(text)
     if text:find("%", 1, true) == nil then
         return text
     end
-    -- Percent escapes are UTF-8 bytes, as in `unescape`. A `+` stays a plus
-    -- sign in a path, so it is escaped before the URL decoding.
-    local ok, decoded = catch string.transcode((text:gsub("+", "%%2B")), "url", "utf-8")
-    if ok then
-        return decoded
-    end
-    return (text:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+    -- A `+` stays a plus sign in a path, so it is escaped before decoding.
+    return percent_decode((text:gsub("+", "%%2B")))
 end
 
 -- Responses ---------------------------------------------------------------------------
@@ -169,7 +173,7 @@ end
 
 --- Sets the status of the response.
 ---
---- A status that the handler returns takes precedence.
+--- A status that the handler returns replaces this one.
 --- @param code integer The status.
 --- @return table The reply, for chaining.
 function Reply:status(code)
@@ -177,10 +181,12 @@ function Reply:status(code)
     return self
 end
 
---- Returns a redirect response for the handler to return.
+--- Sets the `Location` header of the reply, then returns the status and an
+--- empty body for the handler to return.
 --- @param url string The target of the redirect.
 --- @param code integer? The status, 302 by default.
---- @return integer, string, table
+--- @return integer The status.
+--- @return string The empty body.
 function Reply:redirect(url, code)
     self:header("Location", url)
     return code or 302, ""
@@ -272,13 +278,13 @@ end
 
 --- Creates an application.
 ---
---- `options.log` is a function that receives error messages. It defaults to
---- a function that writes to standard error.
+--- `options.log` is a function that receives error messages. By default it
+--- writes them to standard error.
 ---
 --- A handler upgrades a connection, as WebSocket does, by returning `101`,
 --- a function, and optionally headers. `network.serve` sends the 101
 --- response, then calls the function with the TCP socket of the connection.
---- `on_send` hooks do not run for an upgrade.
+--- An upgrade skips the `on_send` hooks.
 --- @param options table? The options.
 --- @return table The application.
 function M.app(options)
@@ -305,9 +311,10 @@ end
 
 --- Adds a route.
 ---
---- `options` may be omitted. It holds the schemas `params`, `query`,
---- `body`, `headers`, and `response`, and per-route hooks under the hook
---- names. `response` is a schema or a table from status codes to schemas.
+--- The optional `options` table holds the schemas `params`, `query`,
+--- `body`, `headers`, and `response`, along with per-route hooks under the
+--- hook names. `response` is a schema or a table from status codes to
+--- schemas. When `handler` is omitted, the third argument is the handler.
 --- @param method string|table The method, a list of methods, or `"*"`.
 --- @param path string The path pattern.
 --- @param options table|function The options, or the handler.
@@ -363,9 +370,9 @@ end
 
 --- Adds a hook to this scope and the scopes registered from it.
 ---
---- `on_send` hooks receive `req, status, body, headers` and return the
---- three values of the response. `on_response` hooks receive `req, status`
---- after them. Both run for every response of the scope, including the
+--- `on_send` hooks receive `req, status, body, headers` and return the three
+--- values of the response. `on_response` hooks run after them and receive
+--- `req, status`. Both run for every response of the scope, including the
 --- response to an error that a handler or a hook raised. The hooks of the
 --- application also run for a request that matches no route, which is
 --- answered with 404 or 405.
@@ -442,14 +449,16 @@ end
 -- Compilation ---------------------------------------------------------------------------------
 
 local function scope_hooks(scope, name, route_options)
-    local chain = {}
+    local chain, depth = {}, 0
     local s = scope
     while s do
-        table.insert(chain, 1, s)
+        depth = depth + 1
+        chain[depth] = s
         s = s.parent
     end
     local out = {}
-    for _, sc in ipairs(chain) do
+    for i = depth, 1, -1 do
+        local sc = chain[i]
         if list = sc.hooks[name] then
             for _, fn in ipairs(list) do
                 out[#out + 1] = fn
@@ -894,8 +903,8 @@ end
 
 --- Returns the request handler of the application for `network.serve`.
 ---
---- The routes are compiled on the first call. Routes added afterward compile
---- on the next call.
+--- The first call compiles the routes. The next call after a change to the
+--- application compiles them again.
 --- @return function
 function Scope:handler()
     local app = self.root
@@ -952,8 +961,8 @@ end
 --- carry a query string, `headers`, and `body`, a string or a table that is
 --- sent as JSON. The result has `status`, `body` as a string, `headers`
 --- with lowercase names, and the methods `json()` and `bytes()`. Bytes of
---- the body that are not valid UTF-8 appear in `body` as U+FFFD, and
---- `bytes()` returns the body as a vector, byte for byte.
+--- the body that are not valid UTF-8 appear in `body` as U+FFFD.
+--- `bytes()` returns every byte of the body unchanged, as a vector.
 --- @param request table The request.
 --- @return table The response.
 function Scope:inject(request)

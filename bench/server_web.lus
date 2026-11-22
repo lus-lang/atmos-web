@@ -3,7 +3,7 @@
 -- other path with 404.
 local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
 pledge("load", "fs:read", "network")
-package.path = HERE .. "/../?.lus;" .. package.path
+package.path = `$HERE/../?.lus;$(package.path)`
 
 local web = require("web")
 

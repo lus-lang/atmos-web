@@ -1,6 +1,6 @@
 local HERE = string.match(arg[0], "^(.*)[/\\][^/\\]*$") or "."
 pledge("load", "fs:read")
-package.path = HERE .. "/../?.lus;" .. package.path
+package.path = `$HERE/../?.lus;$(package.path)`
 local web = require("web")
 local N = 2000000
 local json_headers = { ["Content-Type"] = "application/json" }

@@ -1,7 +1,7 @@
 local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
 local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
-pledge("load", "fs:read=" .. PACKAGES .. "/*")
-package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/schema/?.lus;" .. PACKAGES .. "/atmos-schema/?.lus;" .. package.path
+pledge("load", `fs:read=$PACKAGES/*`)
+package.path = `$ROOT/?.lus;$PACKAGES/schema/?.lus;$PACKAGES/atmos-schema/?.lus;$(package.path)`
 
 local web = require("web")
 local s = require("schema")
@@ -329,7 +329,7 @@ end
 
 local function query_utf8_test()
     assert(web.decode_query("q=%C3%A9t%C3%A9+x").q == "été x")
-    assert(web.decode_query("q=%FF").q == "\u{FF}")
+    assert(web.decode_query("q=%FF").q == "\u{FFFD}")
 end
 
 local function hooks_run_for_error_responses_test()
@@ -396,7 +396,7 @@ local function param_utf8_test()
     app:get("/files/*", function(req) return req.params["*"] end)
     assert(app:inject({ path = "/users/%C3%A9t%C3%A9" }).body == "été")
     assert(app:inject({ path = "/users/a+b%20c" }).body == "a+b c")
-    assert(app:inject({ path = "/users/%FF" }).body == "\u{FF}")
+    assert(app:inject({ path = "/users/%FF" }).body == "\u{FFFD}")
     assert(app:inject({ path = "/files/caf%C3%A9/menu.txt" }).body == "café/menu.txt")
 end
 
