@@ -78,14 +78,7 @@ end
 -- is, and bytes that are not UTF-8 become U+FFFD, as the URL standard
 -- decodes them.
 local function percent_decode(text)
-    local ok, decoded = catch string.transcode(text, "url", "utf-8")
-    if ok then
-        return decoded
-    end
-    local bytes = string.transcode(vector.fromstring(text), "iso-8859-1", "utf-8")
-    bytes = bytes:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
-    local v = string.transcode(bytes, "utf-8", "iso-8859-1")
-    return vector.tostring(v, 0, #v, "lossy")
+    return string.transcode(text, "url", "utf-8", true)
 end
 
 local function unescape(text)
