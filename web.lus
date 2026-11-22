@@ -509,19 +509,22 @@ local function issues_body(where, err)
     return list
 end
 
+local REFUSALS = {
+    [400] = "invalid request body",
+    [408] = "request timeout",
+    [413] = "request body too large",
+    [431] = "request body trailers too large",
+}
+
 -- Returns the status and the message that answer the error of a request
 -- body that `network.serve` refused while it read, or nil for any other
--- error.
+-- error. Such an error is an error object whose `status` is the status of
+-- the refusal.
 local function body_refusal(err)
-    if err:find("request body too large", 1, true) or err:find("framing too large", 1, true) then
-        return 413, "request body too large"
-    elseif err:find("invalid request body: ", 1, true) then
-        if err:find("trailers too large", 1, true) then
-            return 431, "request body trailers too large"
-        elseif err:find("request timeout", 1, true) then
-            return 408, "request timeout"
-        end
-        return 400, "invalid request body"
+    local status = rawget(err, "status")
+    local message = REFUSALS[status]
+    if message and rawget(err, "code") then
+        return status, message
     end
     return nil
 end
@@ -743,7 +746,7 @@ local function compile_route(app, route)
         if getmetatable(err) == HttpError then
             return error_response(err.status, err.message, err.details)
         end
-        if type(err) == "string" then
+        if type(err) == "table" then
             local status, message = body_refusal(err)
             if status then
                 return error_response(status, message)
