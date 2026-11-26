@@ -8,8 +8,15 @@ local s = require("schema")
 
 local function static_routes_test()
     local app = web.app()
-    app:get("/", function(_req) return { message = "hello" } end)
-    app:get("/text", function(_req) return "plain" end)
+
+    app:get("/", function(_req)
+        return { message = "hello" }
+    end)
+
+    app:get("/text", function(_req)
+        return "plain"
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 200)
     assert(res:json().message == "hello")
@@ -21,9 +28,19 @@ end
 
 local function status_and_headers_test()
     local app = web.app()
-    app:post("/items", function(_req) return 201, { id = 1 }, { ["X-Id"] = "1" } end)
-    app:get("/empty", function(_req) return 204 end)
-    app:get("/body-headers", function(_req) return "x", { ["Content-Type"] = "text/html" } end)
+
+    app:post("/items", function(_req)
+        return 201, { id = 1 }, { ["X-Id"] = "1" }
+    end)
+
+    app:get("/empty", function(_req)
+        return 204
+    end)
+
+    app:get("/body-headers", function(_req)
+        return "x", { ["Content-Type"] = "text/html" }
+    end)
+
     local res = app:inject({ method = "POST", path = "/items" })
     assert(res.status == 201)
     assert(res.headers["x-id"] == "1")
@@ -34,10 +51,23 @@ end
 
 local function params_test()
     local app = web.app()
-    app:get("/users/:id", function(req) return { id = req.params.id } end)
-    app:get("/users/:id/posts/:post", function(req) return req.params end)
-    app:get("/users/me", function(_req) return { me = true } end)
-    app:get("/files/*", function(req) return { rest = req.params["*"] } end)
+
+    app:get("/users/:id", function(req)
+        return { id = req.params.id }
+    end)
+
+    app:get("/users/:id/posts/:post", function(req)
+        return req.params
+    end)
+
+    app:get("/users/me", function(_req)
+        return { me = true }
+    end)
+
+    app:get("/files/*", function(req)
+        return { rest = req.params["*"] }
+    end)
+
     assert(app:inject({ path = "/users/42" }):json().id == "42")
     assert(app:inject({ path = "/users/me" }):json().me == true)
     local both = app:inject({ path = "/users/7/posts/9" }):json()
@@ -49,7 +79,11 @@ end
 
 local function query_test()
     local app = web.app()
-    app:get("/search", function(req) return { q = req.query.q, tags = req.query.tag, raw = req.rawquery } end)
+
+    app:get("/search", function(req)
+        return { q = req.query.q, tags = req.query.tag, raw = req.rawquery }
+    end)
+
     local out = app:inject({ path = "/search?q=hello+world&tag=a&tag=b%26c" }):json()
     assert(out.q == "hello world")
     assert(out.tags[1] == "a" and out.tags[2] == "b&c")
@@ -58,20 +92,32 @@ end
 
 local function not_found_and_method_test()
     local app = web.app()
-    app:get("/only-get", function(_req) return "ok" end)
+
+    app:get("/only-get", function(_req)
+        return "ok"
+    end)
+
     local res = app:inject({ path = "/nope" })
     assert(res.status == 404)
     assert(res:json().error == "not found")
     res = app:inject({ method = "DELETE", path = "/only-get" })
     assert(res.status == 405)
     assert(res.headers.allow == "GET, HEAD")
-    app:not_found(function(req) return 404, `no $(req.path)` end)
+
+    app:not_found(function(req)
+        return 404, `no $(req.path)`
+    end)
+
     assert(app:inject({ path = "/x" }).body == "no /x")
 end
 
 local function head_uses_get_test()
     local app = web.app()
-    app:get("/", function(_req) return "body" end)
+
+    app:get("/", function(_req)
+        return "body"
+    end)
+
     local res = app:inject({ method = "HEAD", path = "/" })
     assert(res.status == 200)
     assert(res.body == "")
@@ -79,11 +125,13 @@ end
 
 local function body_validation_test()
     local app = web.app()
+
     app:post("/users", {
         body = s.object({ name = s.string():min(1), age = s.integer():optional() }),
     }, function(req)
         return 201, { name = req.body.name, extra = req.body.extra }
     end)
+
     local res = app:inject({ method = "POST", path = "/users", body = { name = "Ada", extra = 1 } })
     assert(res.status == 201)
     assert(res:json().name == "Ada")
@@ -98,17 +146,31 @@ end
 
 local function invalid_json_test()
     local app = web.app()
-    app:post("/", function(req) return req.body end)
-    local res = app:inject({ method = "POST", path = "/", headers = { ["Content-Type"] = "application/json" }, body = "{" })
+
+    app:post("/", function(req)
+        return req.body
+    end)
+
+    local res = app:inject({
+        method = "POST",
+        path = "/",
+        headers = { ["Content-Type"] = "application/json" },
+        body = "{",
+    })
     assert(res.status == 400)
     assert(res:json().error == "invalid JSON body")
 end
 
 local function form_body_test()
     local app = web.app()
-    app:post("/", function(req) return req.body end)
+
+    app:post("/", function(req)
+        return req.body
+    end)
+
     local res = app:inject({
-        method = "POST", path = "/",
+        method = "POST",
+        path = "/",
         headers = { ["Content-Type"] = "application/x-www-form-urlencoded" },
         body = "a=1&b=two+words",
     })
@@ -117,9 +179,11 @@ end
 
 local function params_coercion_test()
     local app = web.app()
+
     app:get("/items/:id", { params = s.object({ id = s.coerce.integer() }) }, function(req)
         return { id = req.params.id, kind = math.type(req.params.id) }
     end)
+
     local out = app:inject({ path = "/items/12" }):json()
     assert(out.id == 12 and out.kind == "integer")
     assert(app:inject({ path = "/items/x" }).status == 400)
@@ -128,9 +192,11 @@ end
 local function response_schema_test()
     local app = web.app()
     local User = s.object({ id = s.integer(), name = s.string() })
+
     app:get("/user", { response = { [200] = User } }, function(_req)
         return { id = 1, name = "Ada", password = "secret" }
     end)
+
     local out = app:inject({ path = "/user" }):json()
     assert(out.name == "Ada")
     assert(out.password == nil)
@@ -138,7 +204,11 @@ end
 
 local function raise_test()
     local app = web.app()
-    app:get("/teapot", function(_req) web.raise(418, "short and stout", { spout = true }) end)
+
+    app:get("/teapot", function(_req)
+        web.raise(418, "short and stout", { spout = true })
+    end)
+
     local res = app:inject({ path = "/teapot" })
     assert(res.status == 418)
     assert(res:json().error == "short and stout")
@@ -147,8 +217,17 @@ end
 
 local function handler_error_test()
     local logged = {}
-    local app = web.app({ log = function(message) logged[#logged + 1] = message end })
-    app:get("/boom", function(_req) error("boom", 0) end)
+
+    local app = web.app({
+        log = function(message)
+            logged[#logged + 1] = message
+        end,
+    })
+
+    app:get("/boom", function(_req)
+        error("boom", 0)
+    end)
+
     local res = app:inject({ path = "/boom" })
     assert(res.status == 500)
     assert(res:json().error == "internal server error")
@@ -158,48 +237,84 @@ end
 local function hooks_test()
     local app = web.app()
     local order = {}
-    app:hook("on_request", function(_req) order[#order + 1] = "on_request" end)
-    app:hook("pre_handler", function(_req) order[#order + 1] = "pre_handler" end)
+
+    app:hook("on_request", function(_req)
+        order[#order + 1] = "on_request"
+    end)
+
+    app:hook("pre_handler", function(_req)
+        order[#order + 1] = "pre_handler"
+    end)
+
     app:hook("on_send", function(_req, status, body, headers)
         order[#order + 1] = "on_send"
         return status, body .. "!", headers
     end)
-    app:hook("on_response", function(_req, status) order[#order + 1] = `on_response $status` end)
-    app:get("/", function(_req) order[#order + 1] = "handler" return "hi" end)
+
+    app:hook("on_response", function(_req, status)
+        order[#order + 1] = `on_response $status`
+    end)
+
+    app:get("/", function(_req)
+        order[#order + 1] = "handler"
+        return "hi"
+    end)
+
     assert(app:inject({ path = "/" }).body == "hi!")
     assert(table.concat(order, ",") == "on_request,pre_handler,handler,on_send,on_response 200")
 end
 
 local function hook_short_circuit_test()
     local app = web.app()
+
     app:hook("on_request", function(req)
         if req.headers.authorization ~= "secret" then
             return 401, { error = "unauthorized" }
         end
     end)
-    app:get("/", function(_req) return "welcome" end)
+
+    app:get("/", function(_req)
+        return "welcome"
+    end)
+
     assert(app:inject({ path = "/" }).status == 401)
     assert(app:inject({ path = "/", headers = { Authorization = "secret" } }).body == "welcome")
 end
 
 local function on_error_hook_test()
     local app = web.app()
-    app:hook("on_error", function(_req, err) return 503, `failed: $err` end)
-    app:get("/", function(_req) error("db down", 0) end)
+
+    app:hook("on_error", function(_req, err)
+        return 503, `failed: $err`
+    end)
+
+    app:get("/", function(_req)
+        error("db down", 0)
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 503 and res.body == "failed: db down")
 end
 
 local function plugins_encapsulate_test()
     local app = web.app()
+
     app:register(function(api, options)
         api:decorate("version", options.version)
+
         api:hook("on_send", function(_req, status, body, _headers)
             return status, body, { ["X-Api"] = "1", ["Content-Type"] = "text/plain" }
         end)
-        api:get("/info", function(req) return `v$(req.app.version)` end)
+
+        api:get("/info", function(req)
+            return `v$(req.app.version)`
+        end)
     end, { prefix = "/api", version = 2 })
-    app:get("/", function(req) return tostring(req.app.version) end)
+
+    app:get("/", function(req)
+        return tostring(req.app.version)
+    end)
+
     local res = app:inject({ path = "/api/info" })
     assert(res.body == "v2")
     assert(res.headers["x-api"] == "1")
@@ -211,23 +326,41 @@ end
 local function shared_plugin_test()
     local plugin = {
         shared = true,
-        register = function(scope) scope:decorate("db", "sqlite") end,
+        register = function(scope)
+            scope:decorate("db", "sqlite")
+        end,
     }
+
     local app = web.app()
     app:register(plugin)
-    app:get("/", function(req) return req.app.db end)
+
+    app:get("/", function(req)
+        return req.app.db
+    end)
+
     assert(app:inject({ path = "/" }).body == "sqlite")
 end
 
 local function reply_object_test()
     local app = web.app()
+
     app:get("/", function(_req, reply)
         reply:header("X-One", "1"):status(202)
         return { ok = true }
     end)
-    app:get("/go", function(_req, reply) return reply:redirect("/elsewhere") end)
-    app:decorate_reply("hello", function(_reply, name) return 200, `hello $name` end)
-    app:get("/hi", function(_req, reply) return reply:hello("Lus") end)
+
+    app:get("/go", function(_req, reply)
+        return reply:redirect("/elsewhere")
+    end)
+
+    app:decorate_reply("hello", function(_reply, name)
+        return 200, `hello $name`
+    end)
+
+    app:get("/hi", function(_req, reply)
+        return reply:hello("Lus")
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 202 and res.headers["x-one"] == "1")
     res = app:inject({ path = "/go" })
@@ -245,10 +378,18 @@ end
 local function listen_test()
     pledge("network")
     local app = web.app()
-    app:get("/hello/:name", function(req) return { hello = req.params.name } end)
+
+    app:get("/hello/:name", function(req)
+        return { hello = req.params.name }
+    end)
+
     local server = network.tcp.bind("127.0.0.1", 0)
     local _, port = server:getsockname()
-    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+
+    local serving = coroutine.detach(coroutine.create(function()
+        app:listen(server)
+    end))
+
     local sock <close> = network.tcp.connect("127.0.0.1", port)
     sock:send("GET /hello/lus HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
     local response = vector.tostring(sock:receive("*a"))
@@ -270,7 +411,11 @@ local function serve_once(app, request)
     pledge("network")
     local server = network.tcp.bind("127.0.0.1", 0)
     local _, port = server:getsockname()
-    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+
+    local serving = coroutine.detach(coroutine.create(function()
+        app:listen(server)
+    end))
+
     local sock <close> = network.tcp.connect("127.0.0.1", port)
     sock:send(request)
     local response = vector.tostring(sock:receive("*a"))
@@ -282,13 +427,18 @@ end
 local function upgrade_test()
     needs_runtime_additions()
     local app = web.app()
+
     app:get("/ws", function(_req)
         return 101, function(sock)
             sock:send("raw bytes")
         end
     end)
-    local response = serve_once(app, "GET /ws HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+
+    local response = serve_once(
+        app,
+        "GET /ws HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
     assert(response:match("^HTTP/1.1 (%d+)") == "101")
     assert(response:find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", 1, true))
     assert(response:sub(-9) == "raw bytes")
@@ -297,11 +447,13 @@ end
 local function two_cookies_over_the_wire_test()
     needs_runtime_additions()
     local app = web.app()
+
     app:get("/", function(_req, reply)
         reply:header("Set-Cookie", "a=1")
         reply:header("Set-Cookie", "b=2")
         return 204
     end)
+
     local response = serve_once(app, "GET / HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n")
     assert(response:find("\r\nSet-Cookie: a=1\r\n", 1, true))
     assert(response:find("\r\nSet-Cookie: b=2\r\n", 1, true))
@@ -309,8 +461,15 @@ end
 
 local function hook_short_circuit_keeps_body_test()
     local app = web.app()
-    app:hook("pre_handler", function() return 403, "denied", { ["X-A"] = "1" } end)
-    app:get("/", function() return "ok" end)
+
+    app:hook("pre_handler", function()
+        return 403, "denied", { ["X-A"] = "1" }
+    end)
+
+    app:get("/", function()
+        return "ok"
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 403)
     assert(res.body == "denied")
@@ -319,8 +478,15 @@ end
 
 local function on_error_table_body_test()
     local app = web.app()
-    app:hook("on_error", function() return 418, { error = "teapot" } end)
-    app:get("/", function() error("boom") end)
+
+    app:hook("on_error", function()
+        return 418, { error = "teapot" }
+    end)
+
+    app:get("/", function()
+        error("boom")
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 418)
     assert(res:json().error == "teapot")
@@ -333,18 +499,31 @@ local function query_utf8_test()
 end
 
 local function hooks_run_for_error_responses_test()
-    local app = web.app({ log = function() end })
+    local app = web.app({
+        log = function()
+        end,
+    })
+
     local seen = {}
+
     app:hook("on_send", function(_req, status, body, headers)
-        local out = { ["X-Sent"] = tostring(status) }
-        for k, v in pairs(headers or {}) do
-            out[k] = v
-        end
+        local out = table.clone(headers or {})
+        out["X-Sent"] = tostring(status)
         return status, body, out
     end)
-    app:hook("on_response", function(req, status) seen[#seen + 1] = `$(req.path) $status` end)
-    app:get("/raise", function() web.raise(409, "conflict") end)
-    app:get("/crash", function() error("boom") end)
+
+    app:hook("on_response", function(req, status)
+        seen[#seen + 1] = `$(req.path) $status`
+    end)
+
+    app:get("/raise", function()
+        web.raise(409, "conflict")
+    end)
+
+    app:get("/crash", function()
+        error("boom")
+    end)
+
     local res = app:inject({ path = "/raise" })
     assert(res.status == 409 and res.headers["x-sent"] == "409")
     assert(res:json().error == "conflict")
@@ -356,16 +535,25 @@ end
 local function hooks_run_for_unmatched_requests_test()
     local app = web.app()
     local seen = {}
-    app:hook("on_request", function(req) req.started = true end)
+
+    app:hook("on_request", function(req)
+        req.started = true
+    end)
+
     app:hook("on_send", function(req, status, body, headers)
-        local out = { ["X-Started"] = tostring(req.started) }
-        for k, v in pairs(headers or {}) do
-            out[k] = v
-        end
+        local out = table.clone(headers or {})
+        out["X-Started"] = tostring(req.started)
         return status, body, out
     end)
-    app:hook("on_response", function(req, status) seen[#seen + 1] = `$(req.method) $(req.path) $status` end)
-    app:get("/only-get", function() return "ok" end)
+
+    app:hook("on_response", function(req, status)
+        seen[#seen + 1] = `$(req.method) $(req.path) $status`
+    end)
+
+    app:get("/only-get", function()
+        return "ok"
+    end)
+
     local res = app:inject({ path = "/nowhere" })
     assert(res.status == 404 and res:json().error == "not found")
     assert(res.headers["x-started"] == "true")
@@ -375,16 +563,32 @@ local function hooks_run_for_unmatched_requests_test()
     assert(same(seen, { "GET /nowhere 404", "POST /only-get 405" }))
     -- An application without hooks answers the same way.
     local bare = web.app()
-    bare:get("/only-get", function() return "ok" end)
+
+    bare:get("/only-get", function()
+        return "ok"
+    end)
+
     assert(bare:inject({ path = "/nowhere" }).status == 404)
     assert(bare:inject({ method = "POST", path = "/only-get" }).headers.allow == "GET, HEAD")
 end
 
 local function failing_send_hook_keeps_error_response_test()
     local logged = {}
-    local app = web.app({ log = function(message) logged[#logged + 1] = tostring(message) end })
-    app:hook("on_send", function() error("hook failed") end)
-    app:get("/", function() return "ok" end)
+
+    local app = web.app({
+        log = function(message)
+            logged[#logged + 1] = tostring(message)
+        end,
+    })
+
+    app:hook("on_send", function()
+        error("hook failed")
+    end)
+
+    app:get("/", function()
+        return "ok"
+    end)
+
     local res = app:inject({ path = "/" })
     assert(res.status == 500 and res:json().error == "internal server error")
     assert(#logged == 2 and logged[2]:find("hook failed", 1, true))
@@ -392,8 +596,15 @@ end
 
 local function param_utf8_test()
     local app = web.app()
-    app:get("/users/:name", function(req) return req.params.name end)
-    app:get("/files/*", function(req) return req.params["*"] end)
+
+    app:get("/users/:name", function(req)
+        return req.params.name
+    end)
+
+    app:get("/files/*", function(req)
+        return req.params["*"]
+    end)
+
     assert(app:inject({ path = "/users/%C3%A9t%C3%A9" }).body == "été")
     assert(app:inject({ path = "/users/a+b%20c" }).body == "a+b c")
     assert(app:inject({ path = "/users/%FF" }).body == "\u{FFFD}")
@@ -403,12 +614,23 @@ end
 local function inject_binary_body_test()
     local app = web.app()
     local bytes = vector.create(4)
+
     for i = 0, 3 do
         vector.set(bytes, i, 252 + i)
     end
-    app:get("/bin", function() return 200, bytes, { ["Content-Type"] = "application/octet-stream" } end)
-    app:get("/text", function() return "héllo" end)
-    app:get("/vector-text", function() return vector.fromstring("héllo") end)
+
+    app:get("/bin", function()
+        return 200, bytes, { ["Content-Type"] = "application/octet-stream" }
+    end)
+
+    app:get("/text", function()
+        return "héllo"
+    end)
+
+    app:get("/vector-text", function()
+        return vector.fromstring("héllo")
+    end)
+
     local res = app:inject({ path = "/bin" })
     assert(res.status == 200)
     assert(res.body == "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}")
@@ -422,7 +644,11 @@ end
 
 local function client_address_test()
     local app = web.app()
-    app:get("/who", function(req) return { ip = req.ip, port = req.port } end)
+
+    app:get("/who", function(req)
+        return { ip = req.ip, port = req.port }
+    end)
+
     local who = app:inject({ path = "/who" }):json()
     assert(who.ip == "127.0.0.1" and who.port == 0)
     who = app:inject({ path = "/who", ip = "203.0.113.7", port = 4431 }):json()
@@ -431,7 +657,11 @@ end
 
 local function client_address_over_the_wire_test()
     local app = web.app()
-    app:get("/who", function(req) return { ip = req.ip, port = req.port } end)
+
+    app:get("/who", function(req)
+        return { ip = req.ip, port = req.port }
+    end)
+
     local response = serve_once(app, "GET /who HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n")
     local who = fromjson(response:match("\r\n\r\n(.*)$"))
     assert(who.ip == "127.0.0.1")
@@ -441,18 +671,34 @@ end
 local function lazy_body_test()
     local app = web.app()
     local seen
-    app:post("/ignore", { body_read = "lazy" }, function(_req) return "ignored" end)
-    app:post("/read", { body_read = "lazy" }, function(req) return { name = req.body.name, size = #req.raw } end)
+
+    app:post("/ignore", { body_read = "lazy" }, function(_req)
+        return "ignored"
+    end)
+
+    app:post("/read", { body_read = "lazy" }, function(req)
+        return { name = req.body.name, size = #req.raw }
+    end)
+
     app:post("/raw-first", { body_read = "lazy" }, function(req)
         local size = #req.raw
         return { size = size, name = req.body.name }
     end)
+
     app:post("/empty", { body_read = "lazy" }, function(req)
         seen = { body = req.body, raw = req.raw }
         return 204
     end)
-    app:post("/bytes", { body_read = "lazy" }, function(req) return { kind = type(req.body), same = req.body == req.raw } end)
-    local broken = { method = "POST", headers = { ["Content-Type"] = "application/json" }, body = "{nope" }
+
+    app:post("/bytes", { body_read = "lazy" }, function(req)
+        return { kind = type(req.body), same = req.body == req.raw }
+    end)
+
+    local broken = {
+        method = "POST",
+        headers = { ["Content-Type"] = "application/json" },
+        body = "{nope",
+    }
     -- A route that never reads the body never decodes it.
     broken.path = "/ignore"
     assert(app:inject(broken).body == "ignored")
@@ -464,25 +710,45 @@ local function lazy_body_test()
     assert(res:json().name == "lus" and res:json().size == 14)
     assert(app:inject({ method = "POST", path = "/empty" }).status == 204)
     assert(seen.body == nil and #seen.raw == 0)
-    res = app:inject({ method = "POST", path = "/bytes", body = "\1\2", headers = { ["Content-Type"] = "application/octet-stream" } })
+    res = app:inject({
+        method = "POST",
+        path = "/bytes",
+        body = "\1\2",
+        headers = { ["Content-Type"] = "application/octet-stream" },
+    })
     assert(res:json().kind == "vector" and res:json().same)
 end
 
 local function reader_test()
     local messages = {}
-    local app = web.app({ log = function(message) messages[#messages + 1] = tostring(message) end })
+
+    local app = web.app({
+        log = function(message)
+            messages[#messages + 1] = tostring(message)
+        end,
+    })
+
     app:post("/upload", { body_read = "lazy" }, function(req)
         local size = 0
+
         for line in network.lines(req.reader) do
             size = size + #line
         end
+
         return { size = size }
     end)
+
     app:post("/both", { body_read = "lazy" }, function(req)
         coroutine.resume(req.reader)
         return { body = req.body }
     end)
-    local res = app:inject({ method = "POST", path = "/upload", body = "ab\ncd\n", headers = { ["Content-Type"] = "application/json" } })
+
+    local res = app:inject({
+        method = "POST",
+        path = "/upload",
+        body = "ab\ncd\n",
+        headers = { ["Content-Type"] = "application/json" },
+    })
     assert(res:json().size == 4)
     assert(app:inject({ method = "POST", path = "/upload" }):json().size == 0)
     assert(app:inject({ method = "POST", path = "/both", body = "x" }).status == 500)
@@ -491,38 +757,68 @@ end
 
 local function upload_over_the_wire_test()
     local app = web.app()
+
     app:put("/files/:name", { body_read = "lazy" }, function(req)
         local parts, size = 0, 0
         local reader = req.reader
+
         while true do
             local ok, part = coroutine.resume(reader)
             assert(ok, part)
-            if part == nil then break end
+
+            if part == nil then
+                break
+            end
+
             parts = parts + 1
             size = size + #part
         end
+
         return { name = req.params.name, size = size, parts = parts > 0 }
     end)
-    app:post("/json", function(req) return { name = req.body.name, raw = #req.raw } end)
-    app:post("/ignore", { body_read = "lazy" }, function(_req) return "ignored" end)
-    local response = serve_once(app, "PUT /files/a.bin HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+
+    app:post("/json", function(req)
+        return { name = req.body.name, raw = #req.raw }
+    end)
+
+    app:post("/ignore", { body_read = "lazy" }, function(_req)
+        return "ignored"
+    end)
+
+    local response = serve_once(
+        app,
+        "PUT /files/a.bin HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+    )
     local got = fromjson(response:match("\r\n\r\n(.*)$"))
     assert(got.name == "a.bin" and got.size == 11 and got.parts)
-    response = serve_once(app, "POST /json HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}")
+    response = serve_once(
+        app,
+        "POST /json HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}"
+    )
     got = fromjson(response:match("\r\n\r\n(.*)$"))
     assert(got.name == "lus" and got.raw == 14)
-    response = serve_once(app, "POST /ignore HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Content-Type: application/json\r\nContent-Length: 5\r\n\r\n{nope")
+    response = serve_once(
+        app,
+        "POST /ignore HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Content-Type: application/json\r\nContent-Length: 5\r\n\r\n{nope"
+    )
     assert(response:match("\r\n\r\n(.*)$") == "ignored")
 end
 
 local function refused_body_test()
     local app = web.app()
-    app:post("/big", { body_read = "lazy" }, function(req) return { size = #req.raw } end)
-    local response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Content-Length: 20000000\r\n\r\n")
+
+    app:post("/big", { body_read = "lazy" }, function(req)
+        return { size = #req.raw }
+    end)
+
+    local response = serve_once(
+        app,
+        "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Content-Length: 20000000\r\n\r\n"
+    )
     assert(response:match("^HTTP/1.1 (%d+)") == "413")
     assert(fromjson(response:match("\r\n\r\n(.*)$")).error == "request body too large")
 end
@@ -530,10 +826,12 @@ end
 local function stream_test()
     local app = web.app()
     local sent
+
     app:hook("on_send", function(_req, status, body, headers)
         sent = type(body)
         return status, body, headers
     end)
+
     app:get("/events", function(_req)
         return 200, coroutine.create(function()
             coroutine.yield("data: 1\n\n")
@@ -541,20 +839,27 @@ local function stream_test()
             return "data: 3\n\n"
         end), { ["Content-Type"] = "text/event-stream" }
     end)
+
     app:get("/lines", function(_req, reply)
         reply:type("text/csv")
         local n = 0
+
         return function()
             n = n + 1
-            if n <= 2 then return `row $n\n` end
+
+            if n <= 2 then
+                return `row $n\n`
+            end
         end
     end)
+
     app:get("/broken", function(_req)
         return coroutine.create(function()
             coroutine.yield("partial")
             error("stream failed", 0)
         end)
     end)
+
     local res = app:inject({ path = "/events" })
     assert(res.status == 200 and sent == "thread")
     assert(res.body == "data: 1\n\ndata: 2\n\ndata: 3\n\n")
@@ -567,12 +872,16 @@ local function stream_test()
     assert(app:inject({ path = "/" }).chunks == nil)
     res = app:inject({ method = "HEAD", path = "/events" })
     assert(res.status == 200 and res.body == "" and res.chunks == nil)
-    raises(function() app:inject({ path = "/broken" }) end, "stream failed")
+
+    raises(function()
+        app:inject({ path = "/broken" })
+    end, "stream failed")
 end
 
 local function stream_over_the_wire_test()
     pledge("network")
     local app = web.app()
+
     app:get("/events", function(_req)
         return 200, coroutine.create(function()
             for n = 1, 3 do
@@ -580,19 +889,35 @@ local function stream_over_the_wire_test()
             end
         end), { ["Content-Type"] = "text/event-stream" }
     end)
-    app:post("/echo", { body_read = "lazy" }, function(req) return 200, req.reader end)
+
+    app:post("/echo", { body_read = "lazy" }, function(req)
+        return 200, req.reader
+    end)
+
     local server = network.tcp.bind("127.0.0.1", 0)
     local _, port = server:getsockname()
-    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
-    local status, events, headers = network.fetch(`http://127.0.0.1:$port/events`, "GET", nil, nil, { stream = true })
+
+    local serving = coroutine.detach(coroutine.create(function()
+        app:listen(server)
+    end))
+
+    local status, events, headers = network.fetch(
+        `http://127.0.0.1:$port/events`,
+        "GET",
+        nil,
+        nil,
+        { stream = true }
+    )
     assert(status == 200 and headers["content-type"] == "text/event-stream")
     assert(headers["transfer-encoding"] == "chunked")
     local seen = {}
+
     for line in network.lines(events) do
         if #line > 0 then
             seen[#seen + 1] = vector.tostring(line)
         end
     end
+
     assert(table.concat(seen, ",") == "data: 1,data: 2,data: 3")
     local _, echoed = network.fetch(`http://127.0.0.1:$port/echo`, "POST", nil, "sent back")
     assert(vector.tostring(echoed) == "sent back")
@@ -602,25 +927,37 @@ end
 
 local function body_read_test()
     local app = web.app()
+
     local function fields(req)
-        return { name = req.body and req.body.name, raw = req.raw and #req.raw, stored = rawget(req, "body") ~= nil }
+        return {
+            name = req.body?.name,
+            raw = req.raw and #req.raw,
+            stored = rawget(req, "body") ~= nil,
+        }
     end
+
     app:post("/eager", { body_read = "eager" }, function(req)
         local stored = rawget(req, "body") ~= nil and rawget(req, "raw") ~= nil
         local out = fields(req)
         out.before = stored
         return out
     end)
+
     app:post("/lazy", { body_read = "lazy" }, function(req)
         local stored = rawget(req, "body") ~= nil or rawget(req, "raw") ~= nil
         local out = fields(req)
         out.before = stored
         return out
     end)
+
     app:post("/schema", { body = s.object({ name = s.string() }) }, function(req)
         return { before = rawget(req, "raw") ~= nil, name = req.body.name }
     end)
-    app:post("/eager-ignore", { body_read = "eager" }, function(_req) return "ignored" end)
+
+    app:post("/eager-ignore", { body_read = "eager" }, function(_req)
+        return "ignored"
+    end)
+
     local got = app:inject({ method = "POST", path = "/eager", body = { name = "lus" } }):json()
     assert(got.before and got.name == "lus" and got.raw == 14)
     got = app:inject({ method = "POST", path = "/lazy", body = { name = "lus" } }):json()
@@ -630,27 +967,58 @@ local function body_read_test()
     assert(got.before and got.name == "lus")
     assert(app:inject({ method = "POST", path = "/eager" }):json().before == false)
     -- An eager route decodes a body that its handler ignores.
-    local broken = { method = "POST", path = "/eager-ignore", headers = { ["Content-Type"] = "application/json" }, body = "{nope" }
+    local broken = {
+        method = "POST",
+        path = "/eager-ignore",
+        headers = { ["Content-Type"] = "application/json" },
+        body = "{nope",
+    }
     assert(app:inject(broken).status == 400)
-    local quiet = web.app({ log = function() end })
-    quiet:post("/eager-reader", { body_read = "eager" }, function(req) return 200, req.reader end)
+
+    local quiet = web.app({
+        log = function()
+        end,
+    })
+
+    quiet:post("/eager-reader", { body_read = "eager" }, function(req)
+        return 200, req.reader
+    end)
+
     assert(quiet:inject({ method = "POST", path = "/eager-reader", body = "x" }).status == 500)
     local bad = web.app()
-    bad:post("/", { body_read = "sometimes" }, function() end)
-    raises(function() bad:handler() end, "body_read must be 'eager' or 'lazy'")
+
+    bad:post("/", { body_read = "sometimes" }, function()
+    end)
+
+    raises(function()
+        bad:handler()
+    end, "body_read must be 'eager' or 'lazy'")
 end
 
 local function eager_refused_body_test()
     local app = web.app()
-    app:post("/big", { body_read = "eager" }, function(req) return { size = #req.raw } end)
-    local response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Content-Length: 20000000\r\n\r\n")
+
+    app:post("/big", { body_read = "eager" }, function(req)
+        return { size = #req.raw }
+    end)
+
+    local response = serve_once(
+        app,
+        "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Content-Length: 20000000\r\n\r\n"
+    )
     assert(response:match("^HTTP/1.1 (%d+)") == "413")
-    response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Transfer-Encoding: chunked\r\n\r\nzz\r\n")
+    response = serve_once(
+        app,
+        "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Transfer-Encoding: chunked\r\n\r\nzz\r\n"
+    )
     assert(response:match("^HTTP/1.1 (%d+)") == "400")
     assert(fromjson(response:match("\r\n\r\n(.*)$")).error == "invalid request body")
-    response = serve_once(app, "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
-        .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}")
+    response = serve_once(
+        app,
+        "POST /big HTTP/1.1\r\nHost: l\r\nConnection: close\r\n"
+            .. "Content-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"name\":\"lus\"}"
+    )
     assert(fromjson(response:match("\r\n\r\n(.*)$")).size == 14)
 end
