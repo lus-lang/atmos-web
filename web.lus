@@ -740,7 +740,10 @@ local function compile_route(app, route)
     local handler = route.handler
     local options = route.options
     local scope = route.scope
-    local wants_reply = debug.getinfo(handler, "u").nparams >= 2
+    -- Counting the parameters needs the permission `debug`. Without it,
+    -- every handler receives a reply object.
+    local counted, info = catch debug.getinfo(handler, "u")
+    local wants_reply = not counted or info.nparams >= 2
     local on_request = scope_hooks(scope, "on_request", options)
     local pre_validation = scope_hooks(scope, "pre_validation", options)
     local pre_handler = scope_hooks(scope, "pre_handler", options)

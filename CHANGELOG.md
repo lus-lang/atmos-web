@@ -2,7 +2,7 @@
 
 ## 1.0.0
 
-**Release date:** 2026-11-22
+**Release date:** TBD
 
 Version 1.0.0 is the first release of `web`.
 

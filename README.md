@@ -1,9 +1,9 @@
 # [web](https://atmosp.here/2.0/web)
 
-`web` routes the HTTP requests of `network.serve` to handlers, with plugins, hooks, schema validation, and requests in memory for tests.
+Web framework for Lus.
 
 [Instructions for using web can be found here.](https://atmosp.here/2.0/web)
 
 ## License
 
-`web` is licensed under the 0-clause BSD license. It may be used for any purpose, including commercial purposes, at no cost.
+`web` is licensed under the 0-clause BSD license. It may be used for any purpose, including commercial purposes, at no cost. [For more details, consult the license here.](LICENSE)
